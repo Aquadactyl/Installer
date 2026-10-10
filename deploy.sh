@@ -750,32 +750,55 @@ cmd_install() {
         fi
     fi
 
-    # Interactive or environment prompt for database and domain if defaults present
-    local app_url db_name db_user db_pass
-    app_url="$(grep -E '^APP_URL=' .env | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
-    db_name="$(grep -E '^DB_DATABASE=' .env | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
-    db_user="$(grep -E '^DB_USERNAME=' .env | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
-    db_pass="$(grep -E '^DB_PASSWORD=' .env | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
+    # Interactive configuration prompt (reads from /dev/tty so curl | bash can ask questions)
+    if [[ "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" ]]; then
+        local tty_in=""
+        if [[ -e /dev/tty ]]; then
+            tty_in="/dev/tty"
+        elif [[ -t 0 ]]; then
+            tty_in="-"
+        fi
 
-    if [[ -z "${app_url}" || "${app_url}" == "http://localhost" || "${app_url}" == "https://panel.example.com" ]]; then
-        if [[ "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" && -t 0 ]]; then
+        if [[ -n "${tty_in}" ]]; then
             echo ""
             echo "--- Panel Configuration ---"
-            read -rp "Enter Panel Domain/URL [https://panel.example.com]: " input_url
-            input_url="${input_url:-https://panel.example.com}"
-            sed -i "s|^APP_URL=.*|APP_URL=${input_url}|" .env
+            if [[ "${tty_in}" == "/dev/tty" ]]; then
+                read -rp "Enter Panel Domain/URL [https://panel.example.com]: " input_url < /dev/tty
+                input_url="${input_url:-https://panel.example.com}"
+                sed -i "s|^APP_URL=.*|APP_URL=${input_url}|" .env
 
-            read -rp "Enter Database Name [aquadactyl]: " input_dbname
-            input_dbname="${input_dbname:-aquadactyl}"
-            sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${input_dbname}|" .env
+                read -rp "Enter Database Name [panel]: " input_dbname < /dev/tty
+                input_dbname="${input_dbname:-panel}"
+                sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${input_dbname}|" .env
 
-            read -rp "Enter Database User [aquadactyl]: " input_dbuser
-            input_dbuser="${input_dbuser:-aquadactyl}"
-            sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${input_dbuser}|" .env
+                read -rp "Enter Database User [aquadactyl]: " input_dbuser < /dev/tty
+                input_dbuser="${input_dbuser:-aquadactyl}"
+                sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${input_dbuser}|" .env
 
-            read -rsp "Enter Database Password: " input_dbpass
-            echo ""
-            sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${input_dbpass}|" .env
+                read -rsp "Enter Database Password (leave empty to auto-generate): " input_dbpass < /dev/tty
+                echo ""
+                if [[ -n "${input_dbpass}" ]]; then
+                    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${input_dbpass}|" .env
+                fi
+            else
+                read -rp "Enter Panel Domain/URL [https://panel.example.com]: " input_url
+                input_url="${input_url:-https://panel.example.com}"
+                sed -i "s|^APP_URL=.*|APP_URL=${input_url}|" .env
+
+                read -rp "Enter Database Name [panel]: " input_dbname
+                input_dbname="${input_dbname:-panel}"
+                sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${input_dbname}|" .env
+
+                read -rp "Enter Database User [aquadactyl]: " input_dbuser
+                input_dbuser="${input_dbuser:-aquadactyl}"
+                sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${input_dbuser}|" .env
+
+                read -rsp "Enter Database Password (leave empty to auto-generate): " input_dbpass
+                echo ""
+                if [[ -n "${input_dbpass}" ]]; then
+                    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${input_dbpass}|" .env
+                fi
+            fi
 
             # Configure Redis by default as specified in documentation
             sed -i "s|^CACHE_DRIVER=.*|CACHE_DRIVER=redis|" .env
@@ -926,13 +949,22 @@ cmd_install() {
     echo "================================================================================"
     log_ok "Aquadactyl installation completed successfully!"
     echo "================================================================================"
-    if [[ "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" && -t 0 ]]; then
-        echo ""
-        log_info "Prompting to create the primary administrator account..."
-        artisan p:user:make
+    if [[ "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" ]]; then
+        if [[ -e /dev/tty ]]; then
+            echo ""
+            log_info "Prompting to create the primary administrator account..."
+            php "${PANEL_ROOT}/artisan" p:user:make < /dev/tty
+        elif [[ -t 0 ]]; then
+            echo ""
+            log_info "Prompting to create the primary administrator account..."
+            php "${PANEL_ROOT}/artisan" p:user:make
+        else
+            echo "  To create the administrator account, run:"
+            echo "    sudo php ${PANEL_ROOT}/artisan p:user:make"
+        fi
     else
         echo "  To create the administrator account, run:"
-        echo "    sudo -u ${WEB_USER} php ${PANEL_ROOT}/artisan p:user:make"
+        echo "    sudo php ${PANEL_ROOT}/artisan p:user:make"
     fi
     echo "================================================================================"
 }
