@@ -809,15 +809,24 @@ cmd_install() {
     fi
 
     if [[ -n "${db_client}" ]]; then
-        # Create database and grant on both '127.0.0.1' and 'localhost'
+        # Ensure user exists and has permissions across all loopback and local hosts:
+        # '127.0.0.1', 'localhost', and '%' (wildcard)
         "${db_client}" -u root -e "
             CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
-            CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
-            ALTER USER '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
+
+            DROP USER IF EXISTS '${db_user}'@'127.0.0.1';
+            DROP USER IF EXISTS '${db_user}'@'localhost';
+            DROP USER IF EXISTS '${db_user}'@'%';
+
+            CREATE USER '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
             GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1' WITH GRANT OPTION;
-            CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
-            ALTER USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
+
+            CREATE USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
             GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost' WITH GRANT OPTION;
+
+            CREATE USER '${db_user}'@'%' IDENTIFIED BY '${db_pass}';
+            GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'%' WITH GRANT OPTION;
+
             FLUSH PRIVILEGES;
         " >> "${LOG_FILE}" 2>&1 || log_warn "Root database auto-provision failed. Ensure '${db_user}' has access to '${db_name}'."
     fi
@@ -865,12 +874,12 @@ cmd_install() {
 
     # Step 7: Database migrations & seeders
     show_progress "Running Database Migrations & Seeders"
-    artisan down --retry=60 >> "${LOG_FILE}" 2>&1 || true
+    php "${PANEL_ROOT}/artisan" down --retry=60 >> "${LOG_FILE}" 2>&1 || true
     MAINTENANCE_ENABLED=1
 
-    run_silent "database migrations" artisan migrate --force
-    run_silent "blueprint seeder" artisan db:seed --class=BlueprintSeeder --force
-    run_silent "database seeder" artisan db:seed --class=DatabaseSeeder --force
+    run_silent "database migrations" php "${PANEL_ROOT}/artisan" migrate --force
+    run_silent "blueprint seeder" php "${PANEL_ROOT}/artisan" db:seed --class=BlueprintSeeder --force
+    run_silent "database seeder" php "${PANEL_ROOT}/artisan" db:seed --class=DatabaseSeeder --force
 
     # Step 8: Initialize Blueprint & Build Frontend
     show_progress "Initializing Blueprint & Building Frontend"
