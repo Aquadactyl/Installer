@@ -136,6 +136,52 @@ semver_ge() {
     [[ "$lowest" == "$v2" ]]
 }
 
+validate_os() {
+    log_info "Verifying host operating system..."
+    if [[ ! -f /etc/os-release ]]; then
+        log_fatal "Unable to detect host operating system (/etc/os-release missing)."
+        exit "${EX_UNAVAILABLE}"
+    fi
+
+    # Read OS identifier and version ID
+    local os_id os_version_id
+    os_id="$(. /etc/os-release && echo "${ID:-}")"
+    os_version_id="$(. /etc/os-release && echo "${VERSION_ID:-}")"
+
+    local is_supported=0
+
+    case "${os_id}" in
+        debian)
+            # Supported: Debian 12 (Bookworm), Debian 13 (Trixie)
+            local debian_major="${os_version_id%%.*}"
+            if [[ "${debian_major}" == "12" || "${debian_major}" == "13" ]]; then
+                is_supported=1
+            fi
+            ;;
+        ubuntu)
+            # Supported: Ubuntu 24.04/24.10, Ubuntu 26.04
+            local ubuntu_major="${os_version_id%%.*}"
+            if [[ "${ubuntu_major}" == "24" || "${ubuntu_major}" == "26" ]]; then
+                is_supported=1
+            fi
+            ;;
+        *)
+            is_supported=0
+            ;;
+    esac
+
+    if [[ "${is_supported}" -eq 0 ]]; then
+        log_fatal "Unsupported operating system: ${os_id} ${os_version_id}."
+        echo "Supported systems are:" >&2
+        echo "  - Debian 12 (Bookworm) or Debian 13 (Trixie)" >&2
+        echo "  - Ubuntu 24.04+ LTS or Ubuntu 26.04+ LTS" >&2
+        echo "Older releases (Debian <= 11, Ubuntu <= 22) are unsupported." >&2
+        exit "${EX_UNAVAILABLE}"
+    fi
+
+    log_ok "Operating system supported: ${os_id} ${os_version_id}"
+}
+
 detect_php_fpm() {
     if [[ -n "${PHP_FPM_SERVICE}" ]]; then
         return 0
@@ -172,6 +218,8 @@ preflight() {
         log_fatal "This script must be executed as root (e.g. using sudo)."
         exit "${EX_NOPERM}"
     fi
+
+    validate_os
 
     # Source NVM environment if installed in root/home
     if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
@@ -429,6 +477,18 @@ cmd_setup_host() {
         exit "${EX_NOPERM}"
     fi
 
+    # Ensure operating system is supported (Debian 12/13, Ubuntu 24/26)
+    validate_os
+
+    # Source NVM environment if already installed
+    if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
+        # shellcheck source=/dev/null
+        \. "${HOME}/.nvm/nvm.sh"
+    elif [[ -s "/root/.nvm/nvm.sh" ]]; then
+        # shellcheck source=/dev/null
+        \. "/root/.nvm/nvm.sh"
+    fi
+
     export DEBIAN_FRONTEND=noninteractive
 
     apt-get update
@@ -448,46 +508,69 @@ cmd_setup_host() {
         "php${PHP_VERSION}-xml" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-zip" "php${PHP_VERSION}-posix" \
         mariadb-server mariadb-client nginx redis-server git tar unzip rsync util-linux certbot python3-certbot-nginx
 
-    # Install Composer 2
+    # Install Composer 2 if not already present
     if ! command -v composer >/dev/null 2>&1; then
         log_info "Installing Composer 2..."
         curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    else
+        log_ok "Composer is already installed ($(composer --version 2>/dev/null | head -n1)). Skipping."
     fi
 
-    # Download and install Node.js via NVM (v0.40.8) and install Node 24
-    log_info "Installing NVM v0.40.8 and Node.js 24..."
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
-
-    # In lieu of restarting the shell
-    if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
-        # shellcheck source=/dev/null
-        \. "${HOME}/.nvm/nvm.sh"
-    elif [[ -s "/root/.nvm/nvm.sh" ]]; then
-        # shellcheck source=/dev/null
-        \. "/root/.nvm/nvm.sh"
+    # Check if Node.js >= 24 is already installed
+    local existing_node_ver=""
+    if command -v node >/dev/null 2>&1; then
+        existing_node_ver="$(node -v | sed 's/^v//')"
     fi
 
-    # Download and install Node.js:
-    nvm install 24
-    nvm use 24
+    if [[ -n "${existing_node_ver}" ]] && semver_ge "${existing_node_ver}" "24.0.0"; then
+        log_ok "Node.js v${existing_node_ver} (>= 24.0.0) is already installed. Skipping Node installation."
+    else
+        log_info "Installing NVM v0.40.8 and Node.js 24..."
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
 
-    # Update npm to latest version
-    log_info "Updating npm to latest version..."
-    npm i -g npm@latest
+        # In lieu of restarting the shell
+        if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
+            # shellcheck source=/dev/null
+            \. "${HOME}/.nvm/nvm.sh"
+        elif [[ -s "/root/.nvm/nvm.sh" ]]; then
+            # shellcheck source=/dev/null
+            \. "/root/.nvm/nvm.sh"
+        fi
 
-    # Make Node & npm available system-wide for all users (e.g., www-data)
-    local nvm_bin_dir
-    nvm_bin_dir="$(dirname "$(command -v node)")"
-    if [[ -n "${nvm_bin_dir}" && -d "${nvm_bin_dir}" ]]; then
-        ln -sf "${nvm_bin_dir}/node" /usr/local/bin/node
-        ln -sf "${nvm_bin_dir}/npm" /usr/local/bin/npm
-        ln -sf "${nvm_bin_dir}/npx" /usr/local/bin/npx
+        # Download and install Node.js:
+        nvm install 24
+        nvm use 24
+
+        # Update npm to latest version
+        log_info "Updating npm to latest version..."
+        npm i -g npm@latest
+
+        # Make Node & npm available system-wide for all users (e.g., www-data)
+        local nvm_bin_dir
+        nvm_bin_dir="$(dirname "$(command -v node)")"
+        if [[ -n "${nvm_bin_dir}" && -d "${nvm_bin_dir}" ]]; then
+            ln -sf "${nvm_bin_dir}/node" /usr/local/bin/node
+            ln -sf "${nvm_bin_dir}/npm" /usr/local/bin/npm
+            ln -sf "${nvm_bin_dir}/npx" /usr/local/bin/npx
+        fi
     fi
 
-    log_info "Installing pinned pnpm@${DEFAULT_PINNED_PNPM}..."
-    npm install --global "pnpm@${DEFAULT_PINNED_PNPM}"
-    if [[ -n "${nvm_bin_dir}" && -f "${nvm_bin_dir}/pnpm" ]]; then
-        ln -sf "${nvm_bin_dir}/pnpm" /usr/local/bin/pnpm
+    # Check if pnpm is already installed matching pinned version
+    local current_pnpm=""
+    if command -v pnpm >/dev/null 2>&1; then
+        current_pnpm="$(pnpm -v)"
+    fi
+
+    if [[ "${current_pnpm}" == "${DEFAULT_PINNED_PNPM}" ]]; then
+        log_ok "pnpm@${current_pnpm} is already installed. Skipping pnpm installation."
+    else
+        log_info "Installing pinned pnpm@${DEFAULT_PINNED_PNPM}..."
+        npm install --global "pnpm@${DEFAULT_PINNED_PNPM}"
+        local node_bin_loc
+        node_bin_loc="$(dirname "$(command -v node 2>/dev/null || echo '/usr/local/bin/node')")"
+        if [[ -f "${node_bin_loc}/pnpm" ]]; then
+            ln -sf "${node_bin_loc}/pnpm" /usr/local/bin/pnpm
+        fi
     fi
 
     log_ok "Host packages installed successfully."
