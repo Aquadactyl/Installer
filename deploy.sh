@@ -784,19 +784,42 @@ cmd_install() {
         fi
     fi
 
-    # Automated MariaDB provisioning if root MariaDB access is available
-    db_name="$(grep -E '^DB_DATABASE=' .env | cut -d'=' -f2- | tr -d '"'"'" || echo "aquadactyl")"
-    db_user="$(grep -E '^DB_USERNAME=' .env | cut -d'=' -f2- | tr -d '"'"'" || echo "aquadactyl")"
-    db_pass="$(grep -E '^DB_PASSWORD=' .env | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
+    # Ensure MariaDB server is running
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl start mariadb >> "${LOG_FILE}" 2>&1 || systemctl start mysql >> "${LOG_FILE}" 2>&1 || true
+    fi
 
-    if command -v mariadb >/dev/null 2>&1 && [[ -n "${db_pass}" ]]; then
-        mariadb -u root -e "
+    # Read resolved DB parameters from .env
+    db_name="$(grep -E '^DB_DATABASE=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "panel")"
+    db_user="$(grep -E '^DB_USERNAME=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "aquadactyl")"
+    db_pass="$(grep -E '^DB_PASSWORD=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "")"
+
+    # If DB password is empty, generate a secure random one
+    if [[ -z "${db_pass}" ]]; then
+        db_pass="$(head -c 16 /dev/urandom | sha256sum | head -c 24)"
+        sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${db_pass}|" .env
+    fi
+
+    # Automated MariaDB provisioning
+    local db_client=""
+    if command -v mariadb >/dev/null 2>&1; then
+        db_client="mariadb"
+    elif command -v mysql >/dev/null 2>&1; then
+        db_client="mysql"
+    fi
+
+    if [[ -n "${db_client}" ]]; then
+        # Create database and grant on both '127.0.0.1' and 'localhost'
+        "${db_client}" -u root -e "
             CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
             CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
             ALTER USER '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
             GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1' WITH GRANT OPTION;
+            CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
+            ALTER USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
+            GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost' WITH GRANT OPTION;
             FLUSH PRIVILEGES;
-        " 2>/dev/null || log_warn "Could not auto-configure MariaDB as root. Proceeding with existing database."
+        " >> "${LOG_FILE}" 2>&1 || log_warn "Root database auto-provision failed. Ensure '${db_user}' has access to '${db_name}'."
     fi
 
     # Step 4: Preflight checks & Locking
