@@ -109,13 +109,15 @@ run_silent() {
     # Clear task section in log
     echo "=== [$(date)] Starting: ${cmd_desc} ===" >> "${LOG_FILE}"
 
-    # Execute command quietly in background
-    "$@" >> "${LOG_FILE}" 2>&1 &
+    # Execute command quietly in background with disconnected stdin to prevent hung prompts
+    "$@" < /dev/null >> "${LOG_FILE}" 2>&1 &
     local cmd_pid=$!
 
     # Animated spinner frames
     local spin_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     local sc_idx=0
+    local elapsed=0
+    local tick=0
 
     # Hide cursor if supported
     if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
@@ -125,10 +127,14 @@ run_silent() {
     while kill -0 "${cmd_pid}" 2>/dev/null; do
         if [[ -t 1 ]]; then
             local char="${spin_chars[sc_idx]}"
-            printf "\r  ${CLR_BLUE}%s${CLR_RESET} %s... " "${char}" "${cmd_desc}"
+            printf "\r\033[K  ${CLR_BLUE}%s${CLR_RESET} %s... (%ds) " "${char}" "${cmd_desc}" "${elapsed}"
             sc_idx=$(( (sc_idx + 1) % ${#spin_chars[@]} ))
         fi
         sleep 0.1
+        (( tick++ )) || true
+        if (( tick % 10 == 0 )); then
+            (( elapsed++ )) || true
+        fi
     done
 
     # Restore cursor
@@ -141,14 +147,14 @@ run_silent() {
 
     if [[ "${err_code}" -eq 0 ]]; then
         if [[ -t 1 ]]; then
-            printf "\r  ${CLR_GREEN}✓${CLR_RESET} %s [Done]\n" "${cmd_desc}"
+            printf "\r\033[K  ${CLR_GREEN}✓${CLR_RESET} %s (%ds) [Done]\n" "${cmd_desc}" "${elapsed}"
         else
-            echo "  [OK] ${cmd_desc}"
+            echo "  [OK] ${cmd_desc} (${elapsed}s)"
         fi
         return 0
     else
         if [[ -t 1 ]]; then
-            printf "\r  ${CLR_RED}✗${CLR_RESET} %s [Failed]\n" "${cmd_desc}"
+            printf "\r\033[K  ${CLR_RED}✗${CLR_RESET} %s (%ds) [Failed]\n" "${cmd_desc}" "${elapsed}"
         fi
         log_err "${cmd_desc} failed with exit code ${err_code}."
         if [[ -f "${LOG_FILE}" ]]; then
@@ -273,9 +279,11 @@ enforce_root_and_utf8() {
         exit "${EX_NOPERM}"
     fi
 
-    # 2. Enforce UTF-8 in environment
+    # 2. Enforce UTF-8 & non-interactive package handling
     export LC_ALL="C.UTF-8"
     export LANG="C.UTF-8"
+    export DEBIAN_FRONTEND="noninteractive"
+    export NEEDRESTART_MODE="a"
 
     # 3. Enforce UTF-8 in .bashrc for root and default user if present
     local bashrc_targets=("/root/.bashrc")
@@ -1434,10 +1442,44 @@ cmd_remove() {
     fi
 
     if [[ "${purge_pkgs}" -eq 1 ]]; then
-        log_info "Purging system packages..."
-        run_silent "purge packages" apt-get purge -y \
-            "php${PHP_VERSION}*" mariadb-server mariadb-client redis-server nginx
-        run_silent "autoremove" apt-get autoremove -y
+        log_info "Stopping database and web server daemons..."
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop nginx redis-server mariadb mysql "php${PHP_VERSION}-fpm" php-fpm 2>/dev/null || true
+        fi
+
+        # Preseed debconf so MariaDB/MySQL removal never blocks waiting for confirmation
+        if command -v debconf-set-selections >/dev/null 2>&1; then
+            echo "mariadb-server/really_remove_database boolean true" | debconf-set-selections 2>/dev/null || true
+            echo "mysql-server/really_remove_database boolean true" | debconf-set-selections 2>/dev/null || true
+        fi
+
+        # Dynamically discover installed packages to prevent apt erroring on uninstalled packages
+        local pkgs_to_purge=()
+        for p in mariadb-server mariadb-client mariadb-common redis-server nginx nginx-common certbot python3-certbot-nginx; do
+            if dpkg -s "${p}" >/dev/null 2>&1; then
+                pkgs_to_purge+=("${p}")
+            fi
+        done
+        while IFS= read -r p; do
+            [[ -n "${p}" ]] && pkgs_to_purge+=("${p}")
+        done < <(dpkg-query -W -f='${binary:Package}\n' "php*" 2>/dev/null || true)
+
+        if [[ ${#pkgs_to_purge[@]} -gt 0 ]]; then
+            log_info "Purging ${#pkgs_to_purge[@]} packages..."
+            run_silent "purge packages" apt-get purge -y \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold" \
+                "${pkgs_to_purge[@]}"
+        fi
+
+        run_silent "autoremove" apt-get autoremove -y --purge
+
+        # Remove Sury repository files
+        rm -f /etc/apt/sources.list.d/php.list
+        rm -f /usr/share/keyrings/debsuryorg-archive-keyring.gpg
+        rm -f /etc/apt/trusted.gpg.d/php.gpg
+
+        # Remove NVM directories
         rm -rf "${HOME}/.nvm" /root/.nvm
     fi
 
