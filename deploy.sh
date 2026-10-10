@@ -850,7 +850,11 @@ cmd_setup_host() {
         "php${PHP_VERSION}" "php${PHP_VERSION}-cli" "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-gd" \
         "php${PHP_VERSION}-mysql" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-bcmath" \
         "php${PHP_VERSION}-xml" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-zip" "php${PHP_VERSION}-posix" \
-        mariadb-server mariadb-client nginx redis-server git tar zip unzip rsync util-linux certbot python3-certbot-nginx
+        mariadb-server mariadb-client nginx redis-server cron git tar zip unzip rsync util-linux certbot python3-certbot-nginx
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now cron >> "${LOG_FILE}" 2>&1 || systemctl enable --now crond >> "${LOG_FILE}" 2>&1 || true
+    fi
 
     # Install Composer 2 if not already present
     if ! command -v composer >/dev/null 2>&1; then
@@ -1157,12 +1161,46 @@ cmd_install() {
 
     if [[ -f "${PANEL_ROOT}/deploy/systemd/pteroq.service" ]]; then
         cp "${PANEL_ROOT}/deploy/systemd/pteroq.service" /etc/systemd/system/pteroq.service
-        run_silent "reload systemd" systemctl daemon-reload
-        systemctl enable --now pteroq.service >> "${LOG_FILE}" 2>&1 || log_warn "Could not immediately start pteroq.service."
+    else
+        cat > /etc/systemd/system/pteroq.service <<EOF
+[Unit]
+Description=Pterodactyl Queue Worker
+After=redis-server.service
+
+[Service]
+User=${WEB_USER}
+Group=${WEB_GROUP}
+Restart=always
+ExecStart=$(command -v php || echo "/usr/bin/php") ${PANEL_ROOT}/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    run_silent "reload systemd" systemctl daemon-reload
+    systemctl enable --now pteroq.service >> "${LOG_FILE}" 2>&1 || log_warn "Could not immediately start pteroq.service."
+
+    # Install standard Laravel / Pterodactyl cron schedule
+    local php_bin
+    php_bin="$(command -v php || echo "/usr/bin/php")"
+
+    # Add directly into crontab for web user (matching Pterodactyl documentation)
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -u "${WEB_USER}" -l 2>/dev/null | grep -F -v "artisan schedule:run" || true; echo "* * * * * ${php_bin} ${PANEL_ROOT}/artisan schedule:run >> /dev/null 2>&1") | crontab -u "${WEB_USER}" - 2>/dev/null || true
+        rm -f /etc/cron.d/aquadactyl
+    else
+        cat > /etc/cron.d/aquadactyl <<EOF
+* * * * * ${WEB_USER} ${php_bin} ${PANEL_ROOT}/artisan schedule:run >> /dev/null 2>&1
+EOF
+        chmod 0644 /etc/cron.d/aquadactyl
     fi
 
-    echo "* * * * * ${WEB_USER} cd ${PANEL_ROOT} && /usr/bin/php artisan schedule:run >> /dev/null 2>&1" > /etc/cron.d/aquadactyl
-    chmod 0644 /etc/cron.d/aquadactyl
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now cron >> "${LOG_FILE}" 2>&1 || systemctl enable --now crond >> "${LOG_FILE}" 2>&1 || true
+    fi
 
     # Step 10: Finalize & Cache
     show_progress "Finalizing Production Caches"
@@ -1521,6 +1559,9 @@ cmd_remove() {
         run_silent "reload systemd" systemctl daemon-reload
     fi
     rm -f /etc/cron.d/aquadactyl
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -u "${WEB_USER}" -l 2>/dev/null | grep -F -v "artisan schedule:run" || true) | crontab -u "${WEB_USER}" - 2>/dev/null || true
+    fi
 
     # Step 2: Remove Nginx configuration
     show_progress "Removing Web Server Configuration"
