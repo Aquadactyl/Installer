@@ -925,8 +925,84 @@ cmd_install() {
     build_frontend
 
     # Step 9: Configure File Permissions & Daemons
-    show_progress "Configuring Permissions & Services (pteroq/cron)"
+    show_progress "Configuring Permissions & Services (pteroq/cron/nginx)"
     permissions
+
+    # Configure Nginx site
+    if command -v nginx >/dev/null 2>&1 && [[ -d /etc/nginx/sites-available ]]; then
+        log_info "Configuring Nginx web server..."
+        local domain_name
+        domain_name="$(grep -E '^APP_URL=' .env | cut -d'=' -f2- | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:[0-9]*$||' | tr -d '"'"'" || echo "_")"
+        [[ -z "${domain_name}" || "${domain_name}" == "panel.example.com" ]] && domain_name="_"
+
+        local fpm_sock="/run/php/php${PHP_VERSION}-fpm.sock"
+        [[ ! -e "${fpm_sock}" && -e "/run/php/php8.5-fpm.sock" ]] && fpm_sock="/run/php/php8.5-fpm.sock"
+        [[ ! -e "${fpm_sock}" && -e "/run/php/php8.4-fpm.sock" ]] && fpm_sock="/run/php/php8.4-fpm.sock"
+
+        if [[ -f "${PANEL_ROOT}/deploy/nginx/panel.conf" ]]; then
+            cp "${PANEL_ROOT}/deploy/nginx/panel.conf" /etc/nginx/sites-available/aquadactyl.conf
+            sed -i "s|<domain>|${domain_name}|g" /etc/nginx/sites-available/aquadactyl.conf
+            sed -i "s|/var/www/aquadactyl|${PANEL_ROOT}|g" /etc/nginx/sites-available/aquadactyl.conf
+        else
+            cat > /etc/nginx/sites-available/aquadactyl.conf <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain_name};
+
+    root ${PANEL_ROOT}/public;
+    index index.html index.htm index.php;
+    charset utf-8;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ^~ /assets/ {
+        location ~ /\. {
+            deny all;
+        }
+        try_files \$uri =404;
+    }
+
+    location = /favicon.ico { access_log off; log_not_found off; }
+    location = /robots.txt  { access_log off; log_not_found off; }
+
+    access_log off;
+    error_log  /var/log/nginx/aquadactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:${fpm_sock};
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+        fi
+
+        # Remove default nginx site and enable aquadactyl
+        rm -f /etc/nginx/sites-enabled/default
+        ln -sf /etc/nginx/sites-available/aquadactyl.conf /etc/nginx/sites-enabled/aquadactyl.conf
+        nginx -t >> "${LOG_FILE}" 2>&1 && systemctl reload nginx >> "${LOG_FILE}" 2>&1 || systemctl restart nginx >> "${LOG_FILE}" 2>&1 || true
+    fi
 
     if [[ -f "${PANEL_ROOT}/deploy/systemd/pteroq.service" ]]; then
         cp "${PANEL_ROOT}/deploy/systemd/pteroq.service" /etc/systemd/system/pteroq.service
