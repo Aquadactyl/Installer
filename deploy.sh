@@ -314,6 +314,25 @@ enforce_root_and_utf8() {
     done
 }
 
+ensure_apt_unlocked() {
+    # Check if any lingering apt or dpkg processes are holding locks from an interrupted session
+    local stale_pids=""
+    if command -v pgrep >/dev/null 2>&1; then
+        stale_pids="$(pgrep -f "apt-get|dpkg" 2>/dev/null || true)"
+    fi
+    if [[ -n "${stale_pids}" ]]; then
+        log_warn "Lingering apt/dpkg process(es) detected. Terminating them to release locks..."
+        for p in ${stale_pids}; do
+            if [[ "${p}" != "$$" && "${p}" != "${PPID}" ]]; then
+                kill -9 "${p}" 2>/dev/null || true
+            fi
+        done
+        sleep 1
+    fi
+    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
+    dpkg --configure -a >> "${LOG_FILE}" 2>&1 || true
+}
+
 detect_php_fpm() {
     if [[ -n "${PHP_FPM_SERVICE}" ]]; then
         return 0
@@ -1371,7 +1390,9 @@ cmd_remove() {
         if systemctl is-active --quiet "${PTEROQ_SERVICE}" 2>/dev/null; then
             run_silent "stop pteroq" systemctl stop "${PTEROQ_SERVICE}"
         fi
-        systemctl disable "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
+        if systemctl list-unit-files "${PTEROQ_SERVICE}" 2>/dev/null | grep -q "${PTEROQ_SERVICE}"; then
+            systemctl disable "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
+        fi
         rm -f "/etc/systemd/system/${PTEROQ_SERVICE}"
         run_silent "reload systemd" systemctl daemon-reload
     fi
@@ -1405,6 +1426,11 @@ cmd_remove() {
     fi
 
     if [[ -n "${db_client}" ]]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            if ! systemctl is-active --quiet mariadb 2>/dev/null && ! systemctl is-active --quiet mysql 2>/dev/null; then
+                systemctl start mariadb 2>/dev/null || systemctl start mysql 2>/dev/null || true
+            fi
+        fi
         "${db_client}" -u root -e "
             DROP DATABASE IF EXISTS \`${db_name}\`;
             DROP USER IF EXISTS '${db_user}'@'127.0.0.1';
@@ -1442,6 +1468,9 @@ cmd_remove() {
     fi
 
     if [[ "${purge_pkgs}" -eq 1 ]]; then
+        log_info "Releasing any lingering package locks..."
+        ensure_apt_unlocked
+
         log_info "Stopping database and web server daemons..."
         if command -v systemctl >/dev/null 2>&1; then
             systemctl stop nginx redis-server mariadb mysql "php${PHP_VERSION}-fpm" php-fpm 2>/dev/null || true
@@ -1449,8 +1478,13 @@ cmd_remove() {
 
         # Preseed debconf so MariaDB/MySQL removal never blocks waiting for confirmation
         if command -v debconf-set-selections >/dev/null 2>&1; then
-            echo "mariadb-server/really_remove_database boolean true" | debconf-set-selections 2>/dev/null || true
-            echo "mysql-server/really_remove_database boolean true" | debconf-set-selections 2>/dev/null || true
+            debconf-set-selections <<EOF 2>/dev/null || true
+mariadb-server/really_remove_database boolean true
+mariadb-server-10.11/really_remove_database boolean true
+mariadb-server-10.5/really_remove_database boolean true
+mariadb-server-10.6/really_remove_database boolean true
+mysql-server/really_remove_database boolean true
+EOF
         fi
 
         # Dynamically discover installed packages to prevent apt erroring on uninstalled packages
