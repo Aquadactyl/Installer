@@ -76,6 +76,21 @@ log_warn()  { echo -e "${CLR_YELLOW}[WARN]${CLR_RESET} $*" >&2; }
 log_err()   { echo -e "${CLR_RED}[ERROR]${CLR_RESET} $*" >&2; }
 log_fatal() { echo -e "${CLR_RED}${CLR_BOLD}[FATAL]${CLR_RESET} $*" >&2; }
 
+# Silent command runner: suppresses output unless an error occurs
+LOG_FILE="/tmp/aquadactyl-deploy-$(date +%s).log"
+run_silent() {
+    local cmd_desc="${1:-Executing task}"
+    shift
+    if ! "$@" >> "${LOG_FILE}" 2>&1; then
+        local err_code=$?
+        log_err "${cmd_desc} failed with exit code ${err_code}."
+        echo "--- Last 25 lines of output from ${LOG_FILE} ---" >&2
+        tail -n 25 "${LOG_FILE}" >&2
+        echo "------------------------------------------------" >&2
+        return ${err_code}
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 2. Cleanup & Error Trap
 # ------------------------------------------------------------------------------
@@ -182,6 +197,46 @@ validate_os() {
     log_ok "Operating system supported: ${os_id} ${os_version_id}"
 }
 
+enforce_root_and_utf8() {
+    # 1. Enforce root execution
+    if [[ "${EUID}" -ne 0 ]]; then
+        log_fatal "This script must be executed as root (e.g. 'sudo bash $0' or as root user)."
+        exit "${EX_NOPERM}"
+    fi
+
+    # 2. Enforce UTF-8 in environment
+    export LC_ALL="C.UTF-8"
+    export LANG="C.UTF-8"
+
+    # 3. Enforce UTF-8 in .bashrc for root and default user if present
+    local bashrc_targets=("/root/.bashrc")
+    [[ -n "${HOME:-}" && -f "${HOME}/.bashrc" && "${HOME}" != "/root" ]] && bashrc_targets+=("${HOME}/.bashrc")
+
+    for brc in "${bashrc_targets[@]}"; do
+        if [[ -f "${brc}" ]]; then
+            local modified=0
+            if ! grep -q "LC_ALL=.*UTF-8" "${brc}"; then
+                echo 'export LC_ALL="C.UTF-8"' >> "${brc}"
+                modified=1
+            fi
+            if ! grep -q "LANG=.*UTF-8" "${brc}"; then
+                echo 'export LANG="C.UTF-8"' >> "${brc}"
+                modified=1
+            fi
+            # Source bashrc to apply changes immediately
+            if [[ "${modified}" -eq 1 ]]; then
+                # shellcheck source=/dev/null
+                \. "${brc}" 2>/dev/null || true
+            fi
+        else
+            echo 'export LC_ALL="C.UTF-8"' > "${brc}"
+            echo 'export LANG="C.UTF-8"' >> "${brc}"
+            # shellcheck source=/dev/null
+            \. "${brc}" 2>/dev/null || true
+        fi
+    done
+}
+
 detect_php_fpm() {
     if [[ -n "${PHP_FPM_SERVICE}" ]]; then
         return 0
@@ -214,11 +269,7 @@ detect_php_fpm() {
 preflight() {
     log_info "Running environment preflight checks..."
 
-    if [[ "${EUID}" -ne 0 ]]; then
-        log_fatal "This script must be executed as root (e.g. using sudo)."
-        exit "${EX_NOPERM}"
-    fi
-
+    enforce_root_and_utf8
     validate_os
 
     # Source NVM environment if installed in root/home
@@ -375,7 +426,7 @@ dependencies() {
 
     # Composer packages
     log_info "Installing Composer dependencies..."
-    COMPOSER_ALLOW_SUPERUSER=1 composer install \
+    run_silent "composer install" env COMPOSER_ALLOW_SUPERUSER=1 composer install \
         --no-dev \
         --prefer-dist \
         --no-interaction \
@@ -383,16 +434,16 @@ dependencies() {
         --no-scripts \
         --optimize-autoloader
 
-    COMPOSER_ALLOW_SUPERUSER=1 composer check-platform-reqs --no-dev
+    run_silent "composer platform check" env COMPOSER_ALLOW_SUPERUSER=1 composer check-platform-reqs --no-dev
 
     # Node packages
     log_info "Installing frontend dependencies via pnpm..."
-    pnpm install --frozen-lockfile
+    run_silent "pnpm install" pnpm install --frozen-lockfile
 
     permissions
 
     log_info "Discovering packages..."
-    artisan package:discover --ansi
+    run_silent "artisan package:discover" artisan package:discover --ansi
 
     log_ok "Dependencies synchronized."
 }
@@ -419,8 +470,8 @@ EOF
     fi
     chmod 0750 "${PANEL_ROOT}/blueprint.sh"
 
-    # Non-interactive initialization
-    BLUEPRINT_ENVIRONMENT="${BLUEPRINT_ENVIRONMENT}" bash "${PANEL_ROOT}/blueprint.sh"
+    # Non-interactive initialization (suppressed output)
+    run_silent "blueprint initialization" env BLUEPRINT_ENVIRONMENT="${BLUEPRINT_ENVIRONMENT}" bash "${PANEL_ROOT}/blueprint.sh"
 
     # Verify installation flag was created
     if [[ ! -f "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/is_installed" ]]; then
@@ -431,7 +482,7 @@ EOF
     permissions
 
     log_info "Warming Blueprint extension cache..."
-    artisan bp:cache
+    run_silent "artisan bp:cache" artisan bp:cache
 
     log_ok "Blueprint successfully initialized and cached."
 }
@@ -439,9 +490,9 @@ EOF
 build_frontend() {
     log_info "Building production frontend assets..."
     if grep -q '"build:production"' "${PANEL_ROOT}/package.json"; then
-        pnpm run build:production
+        run_silent "pnpm build" pnpm run build:production
     else
-        pnpm run build
+        run_silent "pnpm build" pnpm run build
     fi
     log_ok "Frontend assets compiled."
 }
@@ -452,15 +503,15 @@ finish_deployment() {
     permissions
 
     log_info "Caching Laravel configuration, routes, and views..."
-    artisan config:cache
-    artisan route:cache
-    artisan view:cache
-    artisan queue:restart || true
+    run_silent "artisan config:cache" artisan config:cache
+    run_silent "artisan route:cache" artisan route:cache
+    run_silent "artisan view:cache" artisan view:cache
+    run_silent "artisan queue:restart" artisan queue:restart || true
 
     detect_php_fpm
     if command -v systemctl >/dev/null 2>&1; then
         log_info "Reloading PHP-FPM service (${PHP_FPM_SERVICE})..."
-        systemctl reload "${PHP_FPM_SERVICE}" 2>/dev/null || systemctl restart "${PHP_FPM_SERVICE}" 2>/dev/null || log_warn "Could not reload ${PHP_FPM_SERVICE}."
+        systemctl reload "${PHP_FPM_SERVICE}" >> "${LOG_FILE}" 2>&1 || systemctl restart "${PHP_FPM_SERVICE}" >> "${LOG_FILE}" 2>&1 || log_warn "Could not reload ${PHP_FPM_SERVICE}."
     fi
 
     log_ok "Deployment completed."
@@ -472,12 +523,7 @@ finish_deployment() {
 cmd_setup_host() {
     log_info "Beginning system prerequisites installation (Debian/Ubuntu)..."
 
-    if [[ "${EUID}" -ne 0 ]]; then
-        log_fatal "Must be run as root."
-        exit "${EX_NOPERM}"
-    fi
-
-    # Ensure operating system is supported (Debian 12/13, Ubuntu 24/26)
+    enforce_root_and_utf8
     validate_os
 
     # Source NVM environment if already installed
@@ -491,27 +537,28 @@ cmd_setup_host() {
 
     export DEBIAN_FRONTEND=noninteractive
 
-    apt-get update
-    apt-get install -y lsb-release ca-certificates curl apt-transport-https gnupg
+    log_info "Updating system packages and installing prerequisites..."
+    run_silent "apt-get update" apt-get update
+    run_silent "apt-get install base packages" apt-get install -y lsb-release ca-certificates curl apt-transport-https gnupg
 
     log_info "Adding Sury PHP repository (Debian & Ubuntu)..."
-    curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
-    dpkg -i /tmp/debsuryorg-archive-keyring.deb
+    run_silent "download sury keyring" curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
+    run_silent "install sury keyring" dpkg -i /tmp/debsuryorg-archive-keyring.deb
     rm -f /tmp/debsuryorg-archive-keyring.deb
     sh -c 'echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list'
-    apt-get update
+    run_silent "apt-get update (sury)" apt-get update
 
-    log_info "Installing PHP ${PHP_VERSION}, MariaDB, Nginx, Redis, and system tools..."
-    apt-get install -y \
+    log_info "Installing PHP ${PHP_VERSION}, MariaDB, Nginx, Redis, zip, and system tools..."
+    run_silent "apt-get install server stack" apt-get install -y \
         "php${PHP_VERSION}" "php${PHP_VERSION}-cli" "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-gd" \
         "php${PHP_VERSION}-mysql" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-bcmath" \
         "php${PHP_VERSION}-xml" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-zip" "php${PHP_VERSION}-posix" \
-        mariadb-server mariadb-client nginx redis-server git tar unzip rsync util-linux certbot python3-certbot-nginx
+        mariadb-server mariadb-client nginx redis-server git tar zip unzip rsync util-linux certbot python3-certbot-nginx
 
     # Install Composer 2 if not already present
     if ! command -v composer >/dev/null 2>&1; then
         log_info "Installing Composer 2..."
-        curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+        run_silent "install composer" sh -c "curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer"
     else
         log_ok "Composer is already installed ($(composer --version 2>/dev/null | head -n1)). Skipping."
     fi
@@ -526,7 +573,7 @@ cmd_setup_host() {
         log_ok "Node.js v${existing_node_ver} (>= 24.0.0) is already installed. Skipping Node installation."
     else
         log_info "Installing NVM v0.40.8 and Node.js 24..."
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
+        run_silent "install nvm" sh -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash"
 
         # In lieu of restarting the shell
         if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
@@ -538,12 +585,12 @@ cmd_setup_host() {
         fi
 
         # Download and install Node.js:
-        nvm install 24
-        nvm use 24
+        run_silent "nvm install 24" nvm install 24
+        nvm use 24 >> "${LOG_FILE}" 2>&1 || true
 
         # Update npm to latest version
         log_info "Updating npm to latest version..."
-        npm i -g npm@latest
+        run_silent "npm update" npm i -g npm@latest
 
         # Make Node & npm available system-wide for all users (e.g., www-data)
         local nvm_bin_dir
@@ -565,7 +612,7 @@ cmd_setup_host() {
         log_ok "pnpm@${current_pnpm} is already installed. Skipping pnpm installation."
     else
         log_info "Installing pinned pnpm@${DEFAULT_PINNED_PNPM}..."
-        npm install --global "pnpm@${DEFAULT_PINNED_PNPM}"
+        run_silent "install pnpm" npm install --global "pnpm@${DEFAULT_PINNED_PNPM}"
         local node_bin_loc
         node_bin_loc="$(dirname "$(command -v node 2>/dev/null || echo '/usr/local/bin/node')")"
         if [[ -f "${node_bin_loc}/pnpm" ]]; then
@@ -582,10 +629,7 @@ cmd_setup_host() {
 cmd_install() {
     echo -e "${CLR_CYAN}${CLR_BOLD}=== Aquadactyl Panel Full Automated Installation ===${CLR_RESET}"
 
-    if [[ "${EUID}" -ne 0 ]]; then
-        log_fatal "This script must be executed as root."
-        exit "${EX_NOPERM}"
-    fi
+    enforce_root_and_utf8
 
     # If prerequisites missing, offer or perform host setup
     if ! command -v php >/dev/null 2>&1 || ! command -v composer >/dev/null 2>&1 || ! command -v pnpm >/dev/null 2>&1; then
@@ -709,17 +753,17 @@ cmd_install() {
 
     # Step 7: Database migrations & seeders
     log_info "Entering temporary maintenance mode..."
-    artisan down --retry=60 || true
+    artisan down --retry=60 >> "${LOG_FILE}" 2>&1 || true
     MAINTENANCE_ENABLED=1
 
     log_info "Running database migrations..."
-    artisan migrate --force
+    run_silent "database migrations" artisan migrate --force
 
     log_info "Seeding Blueprint database tables..."
-    artisan db:seed --class=BlueprintSeeder --force
+    run_silent "blueprint seeder" artisan db:seed --class=BlueprintSeeder --force
 
     log_info "Seeding default nests and eggs (DatabaseSeeder)..."
-    artisan db:seed --class=DatabaseSeeder --force
+    run_silent "database seeder" artisan db:seed --class=DatabaseSeeder --force
 
     # Step 8: Initialize Blueprint & Build Frontend
     initialize_blueprint
@@ -991,7 +1035,7 @@ cmd_update() {
 
     # Sync release files
     log_info "Synchronizing updated release files..."
-    rsync -a --no-owner --no-group \
+    run_silent "rsync release files" rsync -a --no-owner --no-group \
         --exclude='.env' \
         --exclude='.blueprintrc' \
         --exclude='storage/' \
@@ -1005,8 +1049,8 @@ cmd_update() {
     dependencies
 
     log_info "Migrating database..."
-    artisan migrate --force
-    artisan db:seed --class=BlueprintSeeder --force
+    run_silent "database migrations" artisan migrate --force
+    run_silent "blueprint seeder" artisan db:seed --class=BlueprintSeeder --force
 
     initialize_blueprint
 
@@ -1022,7 +1066,7 @@ cmd_update() {
 
             if [[ -n "${ext_path}" ]]; then
                 log_info "Reapplying Blueprint extension: ${ext}..."
-                bash "${PANEL_ROOT}/blueprint.sh" -bash -i "${ext_path}" || {
+                run_silent "reapply extension ${ext}" bash "${PANEL_ROOT}/blueprint.sh" -bash -i "${ext_path}" || {
                     log_warn "Failed to reapply extension '${ext}'. Continuing..."
                 }
             fi
@@ -1081,6 +1125,11 @@ EOF
 }
 
 main() {
+    # Immediately enforce root user privileges and UTF-8 environment
+    if [[ "${1:-}" != "-h" && "${1:-}" != "--help" && "${1:-}" != "help" ]]; then
+        enforce_root_and_utf8
+    fi
+
     if [[ $# -eq 0 ]]; then
         # Default action when run without arguments is full automated install
         cmd_install

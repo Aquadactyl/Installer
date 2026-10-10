@@ -27,7 +27,7 @@ To ensure compatibility with modern PHP 8.5 runtimes and current build tooling, 
 - **Ubuntu**: `24.04 LTS`, `24.10`, `26.04+ LTS`
 - **Debian**: `12 (Bookworm)`, `13 (Trixie)`
 
-*(Older releases such as Debian 11 or Ubuntu 22.04 and older are deprecated and unsupported).*
+_(Older releases such as Debian 11 or Ubuntu 22.04 and older are deprecated and unsupported)._
 
 ---
 
@@ -89,14 +89,14 @@ sudo bash deploy.sh permissions
 
 Customize deployment behavior without modifying the script:
 
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `PANEL_ROOT` | `/var/www/aquadactyl` | Absolute directory path to the panel root. |
-| `WEB_USER` | `www-data` | System user executing PHP-FPM and web workers. |
-| `WEB_GROUP` | `www-data` | System group executing PHP-FPM and web workers. |
-| `PHP_VERSION` | `8.5` | Target PHP minor version (`8.4` or `8.5`). |
-| `BACKUP_DIR` | `/var/backups/aquadactyl` | Directory for update snapshots and SQL dumps. |
-| `NON_INTERACTIVE` | `0` | Set to `1` to bypass all terminal questions for CI/headless runs. |
+| Variable          | Default                   | Description                                                       |
+| :---------------- | :------------------------ | :---------------------------------------------------------------- |
+| `PANEL_ROOT`      | `/var/www/aquadactyl`     | Absolute directory path to the panel root.                        |
+| `WEB_USER`        | `www-data`                | System user executing PHP-FPM and web workers.                    |
+| `WEB_GROUP`       | `www-data`                | System group executing PHP-FPM and web workers.                   |
+| `PHP_VERSION`     | `8.5`                     | Target PHP minor version (`8.4` or `8.5`).                        |
+| `BACKUP_DIR`      | `/var/backups/aquadactyl` | Directory for update snapshots and SQL dumps.                     |
+| `NON_INTERACTIVE` | `0`                       | Set to `1` to bypass all terminal questions for CI/headless runs. |
 
 ---
 
