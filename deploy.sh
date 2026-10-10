@@ -600,10 +600,203 @@ build_frontend() {
     log_ok "Frontend assets compiled."
 }
 
+sync_cookie_and_url_security() {
+    if [[ ! -f "${PANEL_ROOT}/.env" ]]; then
+        return 0
+    fi
+
+    local app_url
+    app_url="$(grep -E '^APP_URL=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "http://localhost")"
+
+    if [[ "${app_url}" =~ ^https:// ]]; then
+        log_info "Configuring secure cookies for HTTPS (SESSION_SECURE_COOKIE=true)..."
+        if grep -q "^SESSION_SECURE_COOKIE=" "${PANEL_ROOT}/.env"; then
+            sed -i "s|^SESSION_SECURE_COOKIE=.*|SESSION_SECURE_COOKIE=true|" "${PANEL_ROOT}/.env"
+        else
+            echo "SESSION_SECURE_COOKIE=true" >> "${PANEL_ROOT}/.env"
+        fi
+    else
+        log_info "Configuring cookies for plain HTTP (SESSION_SECURE_COOKIE=false)..."
+        if grep -q "^SESSION_SECURE_COOKIE=" "${PANEL_ROOT}/.env"; then
+            sed -i "s|^SESSION_SECURE_COOKIE=.*|SESSION_SECURE_COOKIE=false|" "${PANEL_ROOT}/.env"
+        else
+            echo "SESSION_SECURE_COOKIE=false" >> "${PANEL_ROOT}/.env"
+        fi
+    fi
+}
+
+configure_nginx() {
+    if ! command -v nginx >/dev/null 2>&1 || [[ ! -d /etc/nginx/sites-available ]]; then
+        return 0
+    fi
+
+    log_info "Configuring Nginx web server..."
+    local app_url domain_name is_https=0
+    app_url="$(grep -E '^APP_URL=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "http://_")"
+    [[ "${app_url}" =~ ^https:// ]] && is_https=1
+
+    domain_name="$(echo "${app_url}" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:[0-9]*$||')"
+    [[ -z "${domain_name}" || "${domain_name}" == "panel.example.com" ]] && domain_name="_"
+
+    local fpm_sock="/run/php/php${PHP_VERSION}-fpm.sock"
+    [[ ! -e "${fpm_sock}" && -e "/run/php/php8.5-fpm.sock" ]] && fpm_sock="/run/php/php8.5-fpm.sock"
+    [[ ! -e "${fpm_sock}" && -e "/run/php/php8.4-fpm.sock" ]] && fpm_sock="/run/php/php8.4-fpm.sock"
+
+    local target_conf="/etc/nginx/sites-available/aquadactyl.conf"
+
+    if [[ "${is_https}" -eq 1 ]]; then
+        log_info "Setting up Nginx configuration for HTTPS (${domain_name})..."
+
+        local ssl_cert="/etc/letsencrypt/live/${domain_name}/fullchain.pem"
+        local ssl_key="/etc/letsencrypt/live/${domain_name}/privkey.pem"
+
+        if [[ ! -f "${ssl_cert}" || ! -f "${ssl_key}" ]]; then
+            ssl_cert="/etc/ssl/certs/aquadactyl.crt"
+            ssl_key="/etc/ssl/private/aquadactyl.key"
+            if [[ ! -f "${ssl_cert}" || ! -f "${ssl_key}" ]]; then
+                log_info "Generating temporary SSL certificate for ${domain_name}..."
+                mkdir -p /etc/ssl/certs /etc/ssl/private
+                openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                    -keyout "${ssl_key}" \
+                    -out "${ssl_cert}" \
+                    -subj "/CN=${domain_name}" >> "${LOG_FILE}" 2>&1 || true
+                chmod 0600 "${ssl_key}" 2>/dev/null || true
+            fi
+        fi
+
+        cat > "${target_conf}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain_name};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${domain_name};
+
+    root ${PANEL_ROOT}/public;
+    index index.html index.htm index.php;
+    charset utf-8;
+
+    ssl_certificate ${ssl_cert};
+    ssl_certificate_key ${ssl_key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ^~ /assets/ {
+        location ~ /\. {
+            deny all;
+        }
+        try_files \$uri =404;
+    }
+
+    location = /favicon.ico { access_log off; log_not_found off; }
+    location = /robots.txt  { access_log off; log_not_found off; }
+
+    access_log off;
+    error_log  /var/log/nginx/aquadactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:${fpm_sock};
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+    else
+        log_info "Setting up Nginx configuration for HTTP (${domain_name})..."
+        cat > "${target_conf}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain_name};
+
+    root ${PANEL_ROOT}/public;
+    index index.html index.htm index.php;
+    charset utf-8;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ^~ /assets/ {
+        location ~ /\. {
+            deny all;
+        }
+        try_files \$uri =404;
+    }
+
+    location = /favicon.ico { access_log off; log_not_found off; }
+    location = /robots.txt  { access_log off; log_not_found off; }
+
+    access_log off;
+    error_log  /var/log/nginx/aquadactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:${fpm_sock};
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+    fi
+
+    # Disable default nginx site and enable aquadactyl
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf "${target_conf}" /etc/nginx/sites-enabled/aquadactyl.conf
+    nginx -t >> "${LOG_FILE}" 2>&1 && systemctl reload nginx >> "${LOG_FILE}" 2>&1 || systemctl restart nginx >> "${LOG_FILE}" 2>&1 || true
+}
+
 finish_deployment() {
     log_info "Finalizing deployment and warming caches..."
 
     permissions
+
+    sync_cookie_and_url_security
 
     log_info "Caching Laravel configuration, routes, and views..."
     run_silent "artisan config:cache" artisan config:cache
@@ -858,6 +1051,9 @@ cmd_install() {
         fi
     fi
 
+    # Synchronize session cookie security based on APP_URL protocol (http vs https)
+    sync_cookie_and_url_security
+
     # Ensure MariaDB server is running
     if command -v systemctl >/dev/null 2>&1; then
         systemctl start mariadb >> "${LOG_FILE}" 2>&1 || systemctl start mysql >> "${LOG_FILE}" 2>&1 || true
@@ -956,81 +1152,8 @@ cmd_install() {
     show_progress "Configuring Permissions & Services (pteroq/cron/nginx)"
     permissions
 
-    # Configure Nginx site
-    if command -v nginx >/dev/null 2>&1 && [[ -d /etc/nginx/sites-available ]]; then
-        log_info "Configuring Nginx web server..."
-        local domain_name
-        domain_name="$(grep -E '^APP_URL=' .env | cut -d'=' -f2- | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:[0-9]*$||' | tr -d '"'"'" || echo "_")"
-        [[ -z "${domain_name}" || "${domain_name}" == "panel.example.com" ]] && domain_name="_"
-
-        local fpm_sock="/run/php/php${PHP_VERSION}-fpm.sock"
-        [[ ! -e "${fpm_sock}" && -e "/run/php/php8.5-fpm.sock" ]] && fpm_sock="/run/php/php8.5-fpm.sock"
-        [[ ! -e "${fpm_sock}" && -e "/run/php/php8.4-fpm.sock" ]] && fpm_sock="/run/php/php8.4-fpm.sock"
-
-        if [[ -f "${PANEL_ROOT}/deploy/nginx/panel.conf" ]]; then
-            cp "${PANEL_ROOT}/deploy/nginx/panel.conf" /etc/nginx/sites-available/aquadactyl.conf
-            sed -i "s|<domain>|${domain_name}|g" /etc/nginx/sites-available/aquadactyl.conf
-            sed -i "s|/var/www/aquadactyl|${PANEL_ROOT}|g" /etc/nginx/sites-available/aquadactyl.conf
-        else
-            cat > /etc/nginx/sites-available/aquadactyl.conf <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain_name};
-
-    root ${PANEL_ROOT}/public;
-    index index.html index.htm index.php;
-    charset utf-8;
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location ^~ /assets/ {
-        location ~ /\. {
-            deny all;
-        }
-        try_files \$uri =404;
-    }
-
-    location = /favicon.ico { access_log off; log_not_found off; }
-    location = /robots.txt  { access_log off; log_not_found off; }
-
-    access_log off;
-    error_log  /var/log/nginx/aquadactyl.app-error.log error;
-
-    client_max_body_size 100m;
-    client_body_timeout 120s;
-    sendfile off;
-
-    location ~ \.php\$ {
-        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
-        fastcgi_pass unix:${fpm_sock};
-        fastcgi_index index.php;
-        include fastcgi_params;
-        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        fastcgi_param HTTP_PROXY "";
-        fastcgi_intercept_errors off;
-        fastcgi_buffer_size 16k;
-        fastcgi_buffers 4 16k;
-        fastcgi_connect_timeout 300;
-        fastcgi_send_timeout 300;
-        fastcgi_read_timeout 300;
-    }
-
-    location ~ /\.ht {
-        deny all;
-    }
-}
-EOF
-        fi
-
-        # Remove default nginx site and enable aquadactyl
-        rm -f /etc/nginx/sites-enabled/default
-        ln -sf /etc/nginx/sites-available/aquadactyl.conf /etc/nginx/sites-enabled/aquadactyl.conf
-        nginx -t >> "${LOG_FILE}" 2>&1 && systemctl reload nginx >> "${LOG_FILE}" 2>&1 || systemctl restart nginx >> "${LOG_FILE}" 2>&1 || true
-    fi
+    # Configure Nginx site according to HTTP/HTTPS protocol
+    configure_nginx
 
     if [[ -f "${PANEL_ROOT}/deploy/systemd/pteroq.service" ]]; then
         cp "${PANEL_ROOT}/deploy/systemd/pteroq.service" /etc/systemd/system/pteroq.service
