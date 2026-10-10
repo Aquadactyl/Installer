@@ -1334,7 +1334,121 @@ cmd_update() {
 }
 
 # ------------------------------------------------------------------------------
-# 8. CLI Usage & Entrypoint
+# 8. Uninstallation / Removal Workflow
+# ------------------------------------------------------------------------------
+cmd_remove() {
+    echo -e "${CLR_RED}${CLR_BOLD}=== Aquadactyl Complete Uninstallation & Removal ===${CLR_RESET}"
+    enforce_root_and_utf8
+
+    if [[ "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" ]]; then
+        echo -e "${CLR_YELLOW}${CLR_BOLD}WARNING:${CLR_RESET} This will permanently delete the panel directory, drop the database, stop services, and remove web server configurations!"
+        local confirm=""
+        if [[ -e /dev/tty ]]; then
+            read -rp "Are you absolutely sure you want to remove Aquadactyl? [type 'yes' to proceed]: " confirm < /dev/tty
+        else
+            read -rp "Are you absolutely sure you want to remove Aquadactyl? [type 'yes' to proceed]: " confirm
+        fi
+        if [[ "${confirm}" != "yes" ]]; then
+            log_info "Uninstallation aborted."
+            return 0
+        fi
+    fi
+
+    TOTAL_STEPS=6
+    CURRENT_STEP=0
+
+    # Step 1: Stop and disable background worker and cron
+    show_progress "Stopping and Removing Services"
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet "${PTEROQ_SERVICE}" 2>/dev/null; then
+            run_silent "stop pteroq" systemctl stop "${PTEROQ_SERVICE}"
+        fi
+        systemctl disable "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
+        rm -f "/etc/systemd/system/${PTEROQ_SERVICE}"
+        run_silent "reload systemd" systemctl daemon-reload
+    fi
+    rm -f /etc/cron.d/aquadactyl
+
+    # Step 2: Remove Nginx configuration
+    show_progress "Removing Web Server Configuration"
+    rm -f /etc/nginx/sites-enabled/aquadactyl.conf
+    rm -f /etc/nginx/sites-available/aquadactyl.conf
+    if [[ -f /etc/nginx/sites-available/default && ! -e /etc/nginx/sites-enabled/default ]]; then
+        ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+    fi
+    if command -v nginx >/dev/null 2>&1; then
+        nginx -t >> "${LOG_FILE}" 2>&1 && systemctl reload nginx >> "${LOG_FILE}" 2>&1 || true
+    fi
+
+    # Step 3: Drop database and database user
+    show_progress "Dropping Database & Credentials"
+    local db_name="panel"
+    local db_user="aquadactyl"
+    if [[ -f "${PANEL_ROOT}/.env" ]]; then
+        db_name="$(grep -E '^DB_DATABASE=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "panel")"
+        db_user="$(grep -E '^DB_USERNAME=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "aquadactyl")"
+    fi
+
+    local db_client=""
+    if command -v mariadb >/dev/null 2>&1; then
+        db_client="mariadb"
+    elif command -v mysql >/dev/null 2>&1; then
+        db_client="mysql"
+    fi
+
+    if [[ -n "${db_client}" ]]; then
+        "${db_client}" -u root -e "
+            DROP DATABASE IF EXISTS \`${db_name}\`;
+            DROP USER IF EXISTS '${db_user}'@'127.0.0.1';
+            DROP USER IF EXISTS '${db_user}'@'localhost';
+            DROP USER IF EXISTS '${db_user}'@'%';
+            FLUSH PRIVILEGES;
+        " >> "${LOG_FILE}" 2>&1 || true
+    fi
+
+    # Step 4: Remove panel files
+    show_progress "Removing Panel Directory (${PANEL_ROOT})"
+    if [[ -d "${PANEL_ROOT}" ]]; then
+        rm -rf "${PANEL_ROOT}"
+    fi
+
+    # Step 5: Clean up global bin symlinks
+    show_progress "Removing Symlinks & Global Binaries"
+    rm -f /usr/local/bin/blueprint
+    rm -f /usr/local/bin/node
+    rm -f /usr/local/bin/npm
+    rm -f /usr/local/bin/npx
+    rm -f /usr/local/bin/pnpm
+
+    # Step 6: Option to purge packages or finish
+    show_progress "Finalizing System Cleanup"
+    local purge_pkgs=0
+    if [[ "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" ]]; then
+        local purge_choice=""
+        if [[ -e /dev/tty ]]; then
+            read -rp "Do you also want to purge installed packages (PHP, MariaDB, Redis, Nginx)? [y/N]: " purge_choice < /dev/tty
+        else
+            read -rp "Do you also want to purge installed packages (PHP, MariaDB, Redis, Nginx)? [y/N]: " purge_choice
+        fi
+        [[ "${purge_choice}" =~ ^[Yy]$ ]] && purge_pkgs=1
+    fi
+
+    if [[ "${purge_pkgs}" -eq 1 ]]; then
+        log_info "Purging system packages..."
+        run_silent "purge packages" apt-get purge -y \
+            "php${PHP_VERSION}*" mariadb-server mariadb-client redis-server nginx
+        run_silent "autoremove" apt-get autoremove -y
+        rm -rf "${HOME}/.nvm" /root/.nvm
+    fi
+
+    echo ""
+    echo "================================================================================"
+    log_ok "Aquadactyl has been completely removed from this system."
+    echo "================================================================================"
+}
+
+# ------------------------------------------------------------------------------
+# 9. CLI Usage & Entrypoint
 # ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
@@ -1349,6 +1463,7 @@ Commands:
   setup-host          Install system packages only (PHP 8.5, MariaDB, Node 22, pnpm 12.10.1, Composer).
   update              Managed zero-downtime update from GitHub release tag or local archive.
   permissions         Restore strict least-privilege permissions across PANEL_ROOT.
+  remove              Complete uninstallation & rollback (stops services, drops DB, deletes panel).
 
 Update Usage:
   sudo bash deploy.sh update <release-tag> [owner/repository]
@@ -1393,6 +1508,9 @@ main() {
         permissions)
             preflight
             permissions
+            ;;
+        remove|uninstall)
+            cmd_remove "$@"
             ;;
         -h|--help|help)
             usage

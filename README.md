@@ -83,6 +83,22 @@ Restore the strict Aquadactyl permission model at any time:
 sudo bash deploy.sh permissions
 ```
 
+### 5. Complete Uninstallation / Revert (`remove`)
+
+Cleanly uninstall Aquadactyl and revert system changes:
+
+```bash
+sudo bash deploy.sh remove
+```
+
+- Stops and disables background workers (`pteroq.service`) and removes the systemd unit.
+- Removes cron configuration `/etc/cron.d/aquadactyl`.
+- Removes the Nginx vhost (`/etc/nginx/sites-available/aquadactyl.conf`) and reloads Nginx.
+- Drops the MariaDB database and user credentials defined in `.env`.
+- Deletes the panel root (`/var/www/aquadactyl`).
+- Cleans up global binary symlinks (`blueprint`, `node`, `npm`, `pnpm`).
+- Prompts whether to optionally purge installed system packages (PHP, MariaDB, Redis, Nginx, NVM).
+
 ---
 
 ## ⚙️ Environment Variables
