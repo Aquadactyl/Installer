@@ -101,13 +101,16 @@ show_progress() {
 }
 
 # Silent command runner with live terminal animation spinner
-LOG_FILE="/tmp/aquadactyl-deploy-$(date +%s).log"
+LOG_FILE="/tmp/aquadactyl-deploy.log"
 run_silent() {
     local cmd_desc="${1:-Executing task}"
     shift
 
-    # Execute command quietly in background subshell
-    ( "$@" ) >> "${LOG_FILE}" 2>&1 &
+    # Clear task section in log
+    echo "=== [$(date)] Starting: ${cmd_desc} ===" >> "${LOG_FILE}"
+
+    # Execute command quietly in background
+    "$@" >> "${LOG_FILE}" 2>&1 &
     local cmd_pid=$!
 
     # Animated spinner frames
@@ -133,8 +136,8 @@ run_silent() {
         tput cnorm 2>/dev/null || true
     fi
 
-    wait "${cmd_pid}"
-    local err_code=$?
+    local err_code=0
+    wait "${cmd_pid}" || err_code=$?
 
     if [[ "${err_code}" -eq 0 ]]; then
         if [[ -t 1 ]]; then
@@ -148,10 +151,10 @@ run_silent() {
             printf "\r  ${CLR_RED}✗${CLR_RESET} %s [Failed]\n" "${cmd_desc}"
         fi
         log_err "${cmd_desc} failed with exit code ${err_code}."
-        if [[ -s "${LOG_FILE}" ]]; then
-            echo "--- Last 25 lines of output from ${LOG_FILE} ---" >&2
+        if [[ -f "${LOG_FILE}" ]]; then
+            echo "--- Last 25 lines from ${LOG_FILE} ---" >&2
             tail -n 25 "${LOG_FILE}" >&2
-            echo "------------------------------------------------" >&2
+            echo "--------------------------------------" >&2
         fi
         return "${err_code}"
     fi
@@ -815,8 +818,10 @@ cmd_install() {
     local app_key
     app_key="$(grep -E '^APP_KEY=' .env | cut -d'=' -f2- || echo "")"
     if [[ -z "${app_key}" || "${app_key}" == "base64:" || "${app_key}" == "SomeRandomString" ]]; then
-        # Run key:generate directly via php to ensure root can write into .env
+        # Ensure .env is writable
+        chmod 0660 "${PANEL_ROOT}/.env" 2>/dev/null || true
         run_silent "generate app key" php "${PANEL_ROOT}/artisan" key:generate --force
+        chmod 0640 "${PANEL_ROOT}/.env" 2>/dev/null || true
     fi
 
     local hashids_salt
