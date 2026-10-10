@@ -173,6 +173,15 @@ preflight() {
         exit "${EX_NOPERM}"
     fi
 
+    # Source NVM environment if installed in root/home
+    if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
+        # shellcheck source=/dev/null
+        \. "${HOME}/.nvm/nvm.sh"
+    elif [[ -s "/root/.nvm/nvm.sh" ]]; then
+        # shellcheck source=/dev/null
+        \. "/root/.nvm/nvm.sh"
+    fi
+
     if ! command -v realpath >/dev/null 2>&1; then
         log_fatal "Required command 'realpath' is missing."
         exit "${EX_UNAVAILABLE}"
@@ -422,13 +431,14 @@ cmd_setup_host() {
 
     export DEBIAN_FRONTEND=noninteractive
 
-    apt-get update && apt-get install -y \
-        software-properties-common curl apt-transport-https ca-certificates gnupg lsb-release
+    apt-get update
+    apt-get install -y lsb-release ca-certificates curl apt-transport-https gnupg
 
-    # Add Ondrej PHP PPA if on Ubuntu or Debian equivalent
-    if command -v add-apt-repository >/dev/null 2>&1; then
-        LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || true
-    fi
+    log_info "Adding Sury PHP repository (Debian & Ubuntu)..."
+    curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
+    dpkg -i /tmp/debsuryorg-archive-keyring.deb
+    rm -f /tmp/debsuryorg-archive-keyring.deb
+    sh -c 'echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list'
     apt-get update
 
     log_info "Installing PHP ${PHP_VERSION}, MariaDB, Nginx, Redis, and system tools..."
@@ -444,15 +454,41 @@ cmd_setup_host() {
         curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
     fi
 
-    # Install Node.js 22 & pinned pnpm
-    if ! command -v node >/dev/null 2>&1 || ! semver_ge "$(node -v | sed 's/^v//')" "22.13.0"; then
-        log_info "Configuring Node.js 22 LTS repository..."
-        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-        apt-get install -y nodejs
+    # Download and install Node.js via NVM (v0.40.8) and install Node 24
+    log_info "Installing NVM v0.40.8 and Node.js 24..."
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
+
+    # In lieu of restarting the shell
+    if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
+        # shellcheck source=/dev/null
+        \. "${HOME}/.nvm/nvm.sh"
+    elif [[ -s "/root/.nvm/nvm.sh" ]]; then
+        # shellcheck source=/dev/null
+        \. "/root/.nvm/nvm.sh"
+    fi
+
+    # Download and install Node.js:
+    nvm install 24
+    nvm use 24
+
+    # Update npm to latest version
+    log_info "Updating npm to latest version..."
+    npm i -g npm@latest
+
+    # Make Node & npm available system-wide for all users (e.g., www-data)
+    local nvm_bin_dir
+    nvm_bin_dir="$(dirname "$(command -v node)")"
+    if [[ -n "${nvm_bin_dir}" && -d "${nvm_bin_dir}" ]]; then
+        ln -sf "${nvm_bin_dir}/node" /usr/local/bin/node
+        ln -sf "${nvm_bin_dir}/npm" /usr/local/bin/npm
+        ln -sf "${nvm_bin_dir}/npx" /usr/local/bin/npx
     fi
 
     log_info "Installing pinned pnpm@${DEFAULT_PINNED_PNPM}..."
     npm install --global "pnpm@${DEFAULT_PINNED_PNPM}"
+    if [[ -n "${nvm_bin_dir}" && -f "${nvm_bin_dir}/pnpm" ]]; then
+        ln -sf "${nvm_bin_dir}/pnpm" /usr/local/bin/pnpm
+    fi
 
     log_ok "Host packages installed successfully."
 }
