@@ -639,6 +639,7 @@ cmd_setup_host() {
     fi
 
     export DEBIAN_FRONTEND=noninteractive
+    ensure_apt_unlocked
 
     log_info "Updating system packages and installing prerequisites..."
     run_silent "apt-get update" apt-get update
