@@ -106,8 +106,8 @@ run_silent() {
     local cmd_desc="${1:-Executing task}"
     shift
 
-    # Run the command in the background, logging to LOG_FILE
-    "$@" >> "${LOG_FILE}" 2>&1 &
+    # Execute command quietly in background subshell
+    ( "$@" ) >> "${LOG_FILE}" 2>&1 &
     local cmd_pid=$!
 
     # Animated spinner frames
@@ -148,9 +148,11 @@ run_silent() {
             printf "\r  ${CLR_RED}✗${CLR_RESET} %s [Failed]\n" "${cmd_desc}"
         fi
         log_err "${cmd_desc} failed with exit code ${err_code}."
-        echo "--- Last 25 lines of output from ${LOG_FILE} ---" >&2
-        tail -n 25 "${LOG_FILE}" >&2
-        echo "------------------------------------------------" >&2
+        if [[ -s "${LOG_FILE}" ]]; then
+            echo "--- Last 25 lines of output from ${LOG_FILE} ---" >&2
+            tail -n 25 "${LOG_FILE}" >&2
+            echo "------------------------------------------------" >&2
+        fi
         return "${err_code}"
     fi
 }
@@ -431,7 +433,13 @@ preflight() {
 }
 
 artisan() {
-    runuser -u "${WEB_USER}" -- php "${PANEL_ROOT}/artisan" "$@"
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "${WEB_USER}" -- php "${PANEL_ROOT}/artisan" "$@"
+    elif command -v su >/dev/null 2>&1; then
+        su -s /bin/sh "${WEB_USER}" -c "php \"${PANEL_ROOT}/artisan\" \"$*\""
+    else
+        php "${PANEL_ROOT}/artisan" "$@"
+    fi
 }
 
 permissions() {
@@ -807,7 +815,8 @@ cmd_install() {
     local app_key
     app_key="$(grep -E '^APP_KEY=' .env | cut -d'=' -f2- || echo "")"
     if [[ -z "${app_key}" || "${app_key}" == "base64:" || "${app_key}" == "SomeRandomString" ]]; then
-        run_silent "generate app key" artisan key:generate --force
+        # Run key:generate directly via php to ensure root can write into .env
+        run_silent "generate app key" php "${PANEL_ROOT}/artisan" key:generate --force
     fi
 
     local hashids_salt
