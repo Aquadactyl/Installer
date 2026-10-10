@@ -76,18 +76,82 @@ log_warn()  { echo -e "${CLR_YELLOW}[WARN]${CLR_RESET} $*" >&2; }
 log_err()   { echo -e "${CLR_RED}[ERROR]${CLR_RESET} $*" >&2; }
 log_fatal() { echo -e "${CLR_RED}${CLR_BOLD}[FATAL]${CLR_RESET} $*" >&2; }
 
-# Silent command runner: suppresses output unless an error occurs
+# Overall Progress Bar State
+TOTAL_STEPS=10
+CURRENT_STEP=0
+
+show_progress() {
+    local step_title="$1"
+    (( CURRENT_STEP++ )) || true
+    if [[ "${CURRENT_STEP}" -gt "${TOTAL_STEPS}" ]]; then
+        CURRENT_STEP="${TOTAL_STEPS}"
+    fi
+
+    local percent=$(( CURRENT_STEP * 100 / TOTAL_STEPS ))
+    local bar_width=28
+    local filled=$(( percent * bar_width / 100 ))
+    local empty=$(( bar_width - filled ))
+
+    local bar=""
+    for (( i=0; i<filled; i++ )); do bar+="#"; done
+    for (( i=0; i<empty; i++ )); do bar+="-"; done
+
+    echo ""
+    echo -e "${CLR_CYAN}${CLR_BOLD}[STEP ${CURRENT_STEP}/${TOTAL_STEPS}]${CLR_RESET} [${CLR_GREEN}${bar}${CLR_RESET}] ${percent}% - ${CLR_BOLD}${step_title}${CLR_RESET}"
+}
+
+# Silent command runner with live terminal animation spinner
 LOG_FILE="/tmp/aquadactyl-deploy-$(date +%s).log"
 run_silent() {
     local cmd_desc="${1:-Executing task}"
     shift
-    if ! "$@" >> "${LOG_FILE}" 2>&1; then
-        local err_code=$?
+
+    # Run the command in the background, logging to LOG_FILE
+    "$@" >> "${LOG_FILE}" 2>&1 &
+    local cmd_pid=$!
+
+    # Animated spinner frames
+    local spin_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local sc_idx=0
+
+    # Hide cursor if supported
+    if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+        tput civis 2>/dev/null || true
+    fi
+
+    while kill -0 "${cmd_pid}" 2>/dev/null; do
+        if [[ -t 1 ]]; then
+            local char="${spin_chars[sc_idx]}"
+            printf "\r  ${CLR_BLUE}%s${CLR_RESET} %s... " "${char}" "${cmd_desc}"
+            sc_idx=$(( (sc_idx + 1) % ${#spin_chars[@]} ))
+        fi
+        sleep 0.1
+    done
+
+    # Restore cursor
+    if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+        tput cnorm 2>/dev/null || true
+    fi
+
+    wait "${cmd_pid}"
+    local err_code=$?
+
+    if [[ "${err_code}" -eq 0 ]]; then
+        if [[ -t 1 ]]; then
+            printf "\r  ${CLR_GREEN}✓${CLR_RESET} %s [Done]\n" "${cmd_desc}"
+        else
+            echo "  [OK] ${cmd_desc}"
+        fi
+        return 0
+    else
+        if [[ -t 1 ]]; then
+            printf "\r  ${CLR_RED}✗${CLR_RESET} %s [Failed]\n" "${cmd_desc}"
+        fi
         log_err "${cmd_desc} failed with exit code ${err_code}."
         echo "--- Last 25 lines of output from ${LOG_FILE} ---" >&2
         tail -n 25 "${LOG_FILE}" >&2
         echo "------------------------------------------------" >&2
-        return ${err_code}
+        return "${err_code}"
     fi
 }
 
@@ -439,6 +503,7 @@ dependencies() {
     # Node packages
     log_info "Installing frontend dependencies via pnpm..."
     run_silent "pnpm install" pnpm install --frozen-lockfile
+    run_silent "npm allow-scripts=pnpm" npm config set allow-scripts=pnpm --location=user || true
 
     permissions
 
@@ -620,6 +685,9 @@ cmd_setup_host() {
         fi
     fi
 
+    # Allow pnpm lifecycle scripts
+    run_silent "npm allow-scripts=pnpm" npm config set allow-scripts=pnpm --location=user || true
+
     log_ok "Host packages installed successfully."
 }
 
@@ -631,19 +699,25 @@ cmd_install() {
 
     enforce_root_and_utf8
 
-    # If prerequisites missing, offer or perform host setup
+    TOTAL_STEPS=10
+    CURRENT_STEP=0
+
+    # Step 1: System Prerequisites
     if ! command -v php >/dev/null 2>&1 || ! command -v composer >/dev/null 2>&1 || ! command -v pnpm >/dev/null 2>&1; then
-        log_info "Required dependencies missing. Auto-installing system prerequisites..."
+        show_progress "Installing Host Prerequisites & Build Tools"
         cmd_setup_host
+    else
+        show_progress "Checking Host Prerequisites"
+        log_ok "Host tools and runtimes verified."
     fi
 
-    # Step 3: Clone panel code if PANEL_ROOT is empty or missing
+    # Step 2: Clone panel repository
+    show_progress "Setting up Panel Filesystem"
     if [[ ! -d "${PANEL_ROOT}" || ! -f "${PANEL_ROOT}/artisan" ]]; then
         log_info "Preparing panel directory at ${PANEL_ROOT}..."
         mkdir -p "${PANEL_ROOT}"
         if [[ -z "$(ls -A "${PANEL_ROOT}")" ]]; then
-            log_info "Cloning Aquadactyl repository from ${REPO_URL}..."
-            git clone "${REPO_URL}" "${PANEL_ROOT}"
+            run_silent "cloning repository" git clone "${REPO_URL}" "${PANEL_ROOT}"
         else
             log_fatal "${PANEL_ROOT} exists and is not empty, but does not contain a valid Aquadactyl repository."
             exit "${EX_DATAERR}"
@@ -652,7 +726,8 @@ cmd_install() {
 
     cd "${PANEL_ROOT}"
 
-    # Step 4: Configure Environment (.env)
+    # Step 3: Configure Environment (.env)
+    show_progress "Configuring Environment (.env)"
     if [[ ! -f "${PANEL_ROOT}/.env" ]]; then
         if [[ -f "${PANEL_ROOT}/.env.example" ]]; then
             log_info "Creating .env from .env.example..."
@@ -704,7 +779,6 @@ cmd_install() {
     db_pass="$(grep -E '^DB_PASSWORD=' .env | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
 
     if command -v mariadb >/dev/null 2>&1 && [[ -n "${db_pass}" ]]; then
-        log_info "Testing/provisioning MariaDB database and user '${db_user}'..."
         mariadb -u root -e "
             CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
             CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
@@ -714,10 +788,10 @@ cmd_install() {
         " 2>/dev/null || log_warn "Could not auto-configure MariaDB as root. Proceeding with existing database."
     fi
 
-    # Now execute standard preflight checks and acquire lock
+    # Step 4: Preflight checks & Locking
+    show_progress "Validating System & Concurrency Lock"
     preflight
 
-    # Safety check: Prevent re-installing over existing initialized Blueprint
     if [[ -f "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/is_installed" ]]; then
         log_fatal "Blueprint is already initialized in this installation."
         echo "Please use 'deploy.sh update' to update or manage this installation." >&2
@@ -725,14 +799,15 @@ cmd_install() {
     fi
 
     # Step 5: Install dependencies
+    show_progress "Installing Composer & PNPM Dependencies"
     dependencies
 
     # Step 6: Generate Encryption Keys and Salt
-    log_info "Configuring encryption keys and salts..."
+    show_progress "Generating Application Keys & Hashids Salt"
     local app_key
     app_key="$(grep -E '^APP_KEY=' .env | cut -d'=' -f2- || echo "")"
     if [[ -z "${app_key}" || "${app_key}" == "base64:" || "${app_key}" == "SomeRandomString" ]]; then
-        artisan key:generate --force
+        run_silent "generate app key" artisan key:generate --force
     fi
 
     local hashids_salt
@@ -752,43 +827,37 @@ cmd_install() {
     fi
 
     # Step 7: Database migrations & seeders
-    log_info "Entering temporary maintenance mode..."
+    show_progress "Running Database Migrations & Seeders"
     artisan down --retry=60 >> "${LOG_FILE}" 2>&1 || true
     MAINTENANCE_ENABLED=1
 
-    log_info "Running database migrations..."
     run_silent "database migrations" artisan migrate --force
-
-    log_info "Seeding Blueprint database tables..."
     run_silent "blueprint seeder" artisan db:seed --class=BlueprintSeeder --force
-
-    log_info "Seeding default nests and eggs (DatabaseSeeder)..."
     run_silent "database seeder" artisan db:seed --class=DatabaseSeeder --force
 
     # Step 8: Initialize Blueprint & Build Frontend
+    show_progress "Initializing Blueprint & Building Frontend"
     initialize_blueprint
     build_frontend
 
-    # Step 9: Configure File Permissions
+    # Step 9: Configure File Permissions & Daemons
+    show_progress "Configuring Permissions & Services (pteroq/cron)"
     permissions
 
-    # Step 10: Configure Background Worker (pteroq.service) & Cron Scheduler
     if [[ -f "${PANEL_ROOT}/deploy/systemd/pteroq.service" ]]; then
-        log_info "Installing pteroq.service systemd unit..."
         cp "${PANEL_ROOT}/deploy/systemd/pteroq.service" /etc/systemd/system/pteroq.service
-        systemctl daemon-reload
-        systemctl enable --now pteroq.service || log_warn "Could not immediately start pteroq.service."
+        run_silent "reload systemd" systemctl daemon-reload
+        systemctl enable --now pteroq.service >> "${LOG_FILE}" 2>&1 || log_warn "Could not immediately start pteroq.service."
     fi
 
-    log_info "Configuring Laravel scheduler in /etc/cron.d/aquadactyl..."
     echo "* * * * * ${WEB_USER} cd ${PANEL_ROOT} && /usr/bin/php artisan schedule:run >> /dev/null 2>&1" > /etc/cron.d/aquadactyl
     chmod 0644 /etc/cron.d/aquadactyl
 
-    # Step 11: Finalize & Cache
+    # Step 10: Finalize & Cache
+    show_progress "Finalizing Production Caches"
     finish_deployment
 
-    # Disable maintenance mode
-    artisan up
+    artisan up >> "${LOG_FILE}" 2>&1 || true
     MAINTENANCE_ENABLED=0
 
     # Step 12: Administrative user creation
@@ -852,23 +921,29 @@ cmd_update() {
         exit "${EX_USAGE}"
     fi
 
-    log_info "Beginning Aquadactyl update process..."
+    TOTAL_STEPS=8
+    CURRENT_STEP=0
+
+    # Step 1: Preflight
+    show_progress "Running Preflight Checks"
     preflight
 
     WORK="$(mktemp -d -t aquadactyl-update-XXXXXX)"
     chmod 0700 "${WORK}"
 
+    # Step 2: Retrieve & Verify Release Archive
+    show_progress "Downloading & Verifying Release Archive"
     if [[ "${mode}" == "release" ]]; then
         log_info "Fetching release '${release_tag}' from '${repo_owner}'..."
         local tarball_url="https://github.com/${repo_owner}/releases/download/${release_tag}/panel.tar.gz"
         local checksums_url="https://github.com/${repo_owner}/releases/download/${release_tag}/SHA256SUMS"
 
-        curl -fSL "${tarball_url}" -o "${WORK}/panel.tar.gz" || {
+        run_silent "download panel.tar.gz" curl -fSL "${tarball_url}" -o "${WORK}/panel.tar.gz" || {
             log_fatal "Failed to download panel archive from: ${tarball_url}"
             exit "${EX_GENERAL}"
         }
 
-        curl -fSL "${checksums_url}" -o "${WORK}/SHA256SUMS" || {
+        run_silent "download SHA256SUMS" curl -fSL "${checksums_url}" -o "${WORK}/SHA256SUMS" || {
             log_fatal "Failed to download SHA256SUMS from: ${checksums_url}"
             exit "${EX_GENERAL}"
         }
@@ -890,16 +965,15 @@ cmd_update() {
         cp "${archive_path}" "${WORK}/panel.tar.gz"
     fi
 
-    log_info "Verifying SHA256 digest..."
     local actual_hash
     actual_hash="$(sha256sum "${WORK}/panel.tar.gz" | awk '{print $1}')"
     if [[ "${actual_hash}" != "${expected_hash}" ]]; then
         log_fatal "Checksum mismatch! Expected: ${expected_hash}, Calculated: ${actual_hash}"
         exit "${EX_DATAERR}"
     fi
-    log_ok "Checksum verified (${actual_hash})."
 
-    log_info "Auditing archive structure..."
+    # Step 3: Security audit & extraction
+    show_progress "Auditing & Extracting Archive"
     tar -tzf "${WORK}/panel.tar.gz" > "${WORK}/archive_index.txt"
 
     if grep -E '(^/|\.\./)' "${WORK}/archive_index.txt"; then
@@ -918,7 +992,7 @@ cmd_update() {
     fi
 
     mkdir -p "${WORK}/release"
-    tar -xzf "${WORK}/panel.tar.gz" --no-same-owner --no-same-permissions -C "${WORK}/release"
+    run_silent "extracting release archive" tar -xzf "${WORK}/panel.tar.gz" --no-same-owner --no-same-permissions -C "${WORK}/release"
 
     local required_release_files=(
         "artisan"
@@ -935,7 +1009,8 @@ cmd_update() {
         fi
     done
 
-    # Extension inventory pre-flight
+    # Step 4: Extension Inventory Pre-flight
+    show_progress "Auditing Installed Blueprint Extensions"
     local installed_ext_file="${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/installed_extensions"
     local extensions=()
     if [[ -f "${installed_ext_file}" ]]; then
@@ -966,8 +1041,8 @@ cmd_update() {
         done
     fi
 
-    # Backup Creation
-    log_info "Creating snapshot backup..."
+    # Step 5: Backup Creation
+    show_progress "Creating Database & Filesystem Snapshots"
     BACKUP_DIR="$(realpath -m "${BACKUP_DIR}")"
     if [[ "${BACKUP_DIR}" == "${PANEL_ROOT}"* ]]; then
         log_fatal "BACKUP_DIR (${BACKUP_DIR}) cannot be located within PANEL_ROOT (${PANEL_ROOT})."
@@ -978,25 +1053,22 @@ cmd_update() {
     BACKUP="$(mktemp -d "${BACKUP_DIR}/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
     chmod 0700 "${BACKUP}"
 
-    artisan down --retry=60 || true
+    artisan down --retry=60 >> "${LOG_FILE}" 2>&1 || true
     MAINTENANCE_ENABLED=1
 
     if command -v systemctl >/dev/null 2>&1; then
         if systemctl is-active --quiet "${PTEROQ_SERVICE}"; then
-            log_info "Stopping queue service: ${PTEROQ_SERVICE}..."
-            systemctl stop "${PTEROQ_SERVICE}"
+            systemctl stop "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
             PTEROQ_WAS_RUNNING=1
         fi
     fi
 
-    log_info "Exporting database backup..."
     local db_dump_ok=0
-    if artisan p:maintenance:backup-database "${BACKUP}/database.sql" 2>/dev/null; then
+    if run_silent "database backup" artisan p:maintenance:backup-database "${BACKUP}/database.sql"; then
         db_dump_ok=1
     fi
 
     if [[ "${db_dump_ok}" -eq 0 ]]; then
-        log_info "Falling back to direct mariadb-dump / mysqldump..."
         local db_host db_port db_name db_user db_pass
         db_host="$(grep -E '^DB_HOST=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" || echo "127.0.0.1")"
         db_port="$(grep -E '^DB_PORT=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" || echo "3306")"
@@ -1014,7 +1086,7 @@ cmd_update() {
             exit "${EX_UNAVAILABLE}"
         fi
 
-        "${dump_tool}" --host="${db_host}" --port="${db_port}" --user="${db_user}" --password="${db_pass}" \
+        run_silent "database sql dump" "${dump_tool}" --host="${db_host}" --port="${db_port}" --user="${db_user}" --password="${db_pass}" \
             --single-transaction --quick --routines "${db_name}" > "${BACKUP}/database.sql"
     fi
 
@@ -1023,8 +1095,7 @@ cmd_update() {
         exit "${EX_GENERAL}"
     fi
 
-    log_info "Archiving panel filesystem..."
-    tar --exclude='./node_modules' \
+    run_silent "archiving panel directory" tar --exclude='./node_modules' \
         --exclude='./.git' \
         --exclude='./storage/logs/*.log' \
         --exclude='./storage/framework/cache/data/*' \
@@ -1033,8 +1104,8 @@ cmd_update() {
     chmod 0600 "${BACKUP}/database.sql" "${BACKUP}/panel.tar.gz"
     log_ok "Backup created at: ${BACKUP}"
 
-    # Sync release files
-    log_info "Synchronizing updated release files..."
+    # Step 6: Sync Files & Dependencies
+    show_progress "Synchronizing Release Files & Dependencies"
     run_silent "rsync release files" rsync -a --no-owner --no-group \
         --exclude='.env' \
         --exclude='.blueprintrc' \
@@ -1048,7 +1119,8 @@ cmd_update() {
 
     dependencies
 
-    log_info "Migrating database..."
+    # Step 7: Migrations & Extensions
+    show_progress "Running Migrations & Reapplying Extensions"
     run_silent "database migrations" artisan migrate --force
     run_silent "blueprint seeder" artisan db:seed --class=BlueprintSeeder --force
 
@@ -1073,16 +1145,16 @@ cmd_update() {
         done
     fi
 
+    # Step 8: Build Frontend & Bring Online
+    show_progress "Building Frontend & Finalizing Deployment"
     build_frontend
     finish_deployment
 
     if [[ "${PTEROQ_WAS_RUNNING}" -eq 1 ]]; then
-        log_info "Restarting background queue worker: ${PTEROQ_SERVICE}..."
-        systemctl start "${PTEROQ_SERVICE}" || log_warn "Failed to start ${PTEROQ_SERVICE}."
+        systemctl start "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || log_warn "Failed to start ${PTEROQ_SERVICE}."
     fi
 
-    log_info "Bringing panel back online..."
-    artisan up
+    artisan up >> "${LOG_FILE}" 2>&1 || true
     MAINTENANCE_ENABLED=0
 
     echo ""
