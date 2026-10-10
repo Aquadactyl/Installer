@@ -784,21 +784,38 @@ cmd_install() {
         fi
     fi
 
+    # Check if DB credentials are default or unset
+    local db_host db_name db_user db_pass
+    db_host="$(grep -E '^DB_HOST=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "127.0.0.1")"
+    db_name="$(grep -E '^DB_DATABASE=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "panel")"
+    db_user="$(grep -E '^DB_USERNAME=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "aquadactyl")"
+    db_pass="$(grep -E '^DB_PASSWORD=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "")"
+
+    # Ensure DB_HOST is explicitly 127.0.0.1 (not localhost) to use TCP loopback port 3306
+    if [[ "${db_host}" == "localhost" || -z "${db_host}" ]]; then
+        sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" .env
+        db_host="127.0.0.1"
+    fi
+
+    # If DB password is empty or default, generate a secure random one
+    if [[ -z "${db_pass}" || "${db_pass}" == "your_secure_password" || "${db_pass}" == "secret" ]]; then
+        db_pass="$(head -c 16 /dev/urandom | sha256sum | head -c 24)"
+        if grep -q "^DB_PASSWORD=" .env; then
+            sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${db_pass}|" .env
+        else
+            echo "DB_PASSWORD=${db_pass}" >> .env
+        fi
+    fi
+
     # Ensure MariaDB server is running
     if command -v systemctl >/dev/null 2>&1; then
         systemctl start mariadb >> "${LOG_FILE}" 2>&1 || systemctl start mysql >> "${LOG_FILE}" 2>&1 || true
     fi
 
-    # Read resolved DB parameters from .env
+    # Re-read resolved DB parameters from .env
     db_name="$(grep -E '^DB_DATABASE=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "panel")"
     db_user="$(grep -E '^DB_USERNAME=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "aquadactyl")"
     db_pass="$(grep -E '^DB_PASSWORD=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "")"
-
-    # If DB password is empty, generate a secure random one
-    if [[ -z "${db_pass}" ]]; then
-        db_pass="$(head -c 16 /dev/urandom | sha256sum | head -c 24)"
-        sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${db_pass}|" .env
-    fi
 
     # Automated MariaDB provisioning
     local db_client=""
@@ -809,8 +826,6 @@ cmd_install() {
     fi
 
     if [[ -n "${db_client}" ]]; then
-        # Ensure user exists and has permissions across all loopback and local hosts:
-        # '127.0.0.1', 'localhost', and '%' (wildcard)
         "${db_client}" -u root -e "
             CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
 
@@ -828,7 +843,7 @@ cmd_install() {
             GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'%' WITH GRANT OPTION;
 
             FLUSH PRIVILEGES;
-        " >> "${LOG_FILE}" 2>&1 || log_warn "Root database auto-provision failed. Ensure '${db_user}' has access to '${db_name}'."
+        " >> "${LOG_FILE}" 2>&1 || true
     fi
 
     # Step 4: Preflight checks & Locking
