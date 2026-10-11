@@ -35,7 +35,7 @@ _(Older releases such as Debian 11 or Ubuntu 22.04 and older are deprecated and 
 
 ### 1. Automated Host Provisioning (`setup-host`)
 
-- **PHP 8.5 & FPM**: Configures the official [Ondřej Surý](https://packages.sury.org/php/) Debian/Ubuntu repository with all required extensions (`bcmath`, `curl`, `gd`, `mbstring`, `pdo_mysql`, `posix`, `xml`, `zip`).
+- **PHP 8.5 & FPM**: Configures the official [Ondřej Surý](https://packages.sury.org/php/) Debian/Ubuntu repository with all required extensions (`bcmath`, `curl`, `gd`, `intl`, `mbstring`, `pdo_mysql`, `posix`, `redis`, `xml`, `zip`).
 - **Node.js & npm**: Idempotently installs NVM `v0.40.8`, Node.js `24`, and the latest `npm` (skips if Node $\ge$ 24 is already present).
 - **pnpm**: Installs the pinned `pnpm@12.10.1` package manager.
 - **Composer**: Installs Composer 2.
