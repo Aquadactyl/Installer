@@ -50,7 +50,7 @@ _(Older releases such as Debian 11 or Ubuntu 22.04 and older are deprecated and 
 - Automatically executes migrations, seeds Blueprint tables, and seeds default nests & eggs (`DatabaseSeeder`).
 - Headlessly bootstraps **Blueprint beta-2026-08** and warms its extension cache (`artisan bp:cache`).
 - Compiles production frontend assets (`pnpm run build:production`).
-- Deploys the background worker (`pteroq.service`) and the Laravel cron scheduler (`/etc/cron.d/aquadactyl`).
+- Deploys the background worker (`aquaq.service`) and the Laravel cron scheduler (`/etc/cron.d/aquadactyl`).
 - Normalizes strict least-privilege permissions (`root:www-data`, `0750`/`0640`, only `storage` and `bootstrap/cache` writable by `www-data`).
 - Guides you through creating your initial administrator account.
 
@@ -70,7 +70,7 @@ _(Older releases such as Debian 11 or Ubuntu 22.04 and older are deprecated and 
 
 - **Safety First**:
   - Automatically creates a timestamped private backup (`/var/backups/aquadactyl/`) containing a full database SQL dump and compressed file snapshot.
-  - Pauses background queues (`pteroq.service`) and enters maintenance mode.
+  - Pauses background queues (`aquaq.service`) and enters maintenance mode.
   - Syncs the release archive while strictly preserving `.env`, `.blueprintrc`, and extension data.
   - Re-applies all installed Blueprint extensions non-interactively.
   - Traps failures: keeps maintenance mode active upon any error and outputs step-by-step recovery commands.
@@ -91,7 +91,7 @@ Cleanly uninstall Aquadactyl and revert system changes:
 sudo bash deploy.sh remove
 ```
 
-- Stops and disables background workers (`pteroq.service`) and removes the systemd unit.
+- Stops and disables background workers (`aquaq.service`) and removes the systemd unit.
 - Removes cron configuration `/etc/cron.d/aquadactyl`.
 - Removes the Nginx vhost (`/etc/nginx/sites-available/aquadactyl.conf`) and reloads Nginx.
 - Drops the MariaDB database and user credentials defined in `.env`.
@@ -122,7 +122,7 @@ If an update is interrupted or encounters an unrecoverable error, the script pri
 
 ```bash
 # 1. Stop services
-sudo systemctl stop php8.5-fpm pteroq.service
+sudo systemctl stop php8.5-fpm aquaq.service
 
 # 2. Extract files
 sudo tar -xzf /var/backups/aquadactyl/<TIMESTAMP>/panel.tar.gz -C /var/www/aquadactyl
@@ -132,7 +132,7 @@ sudo mariadb -u aquadactyl -p aquadactyl < /var/backups/aquadactyl/<TIMESTAMP>/d
 
 # 4. Normalize permissions and start
 sudo bash /var/www/aquadactyl/deploy.sh permissions
-sudo systemctl start php8.5-fpm pteroq.service
+sudo systemctl start php8.5-fpm aquaq.service
 sudo -u www-data php /var/www/aquadactyl/artisan up
 ```
 

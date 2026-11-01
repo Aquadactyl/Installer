@@ -26,6 +26,7 @@ WEB_USER="${WEB_USER:-www-data}"
 WEB_GROUP="${WEB_GROUP:-www-data}"
 PHP_VERSION="${PHP_VERSION:-8.5}"
 PHP_FPM_SERVICE="${PHP_FPM_SERVICE:-}"
+AQUAQ_SERVICE="${AQUAQ_SERVICE:-aquaq.service}"
 PTEROQ_SERVICE="${PTEROQ_SERVICE:-pteroq.service}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/aquadactyl}"
 BLUEPRINT_ENVIRONMENT="${BLUEPRINT_ENVIRONMENT:-ci}"
@@ -39,6 +40,7 @@ BACKUP=""
 LOCK_FD=9
 LOCK_ACQUIRED=0
 MAINTENANCE_ENABLED=0
+AQUAQ_WAS_RUNNING=0
 PTEROQ_WAS_RUNNING=0
 
 # Standard POSIX / sysexits exit codes
@@ -1154,35 +1156,53 @@ cmd_install() {
     build_frontend
 
     # Step 9: Configure File Permissions & Daemons
-    show_progress "Configuring Permissions & Services (pteroq/cron/nginx)"
+    show_progress "Configuring Permissions & Services (aquaq/cron/nginx)"
     permissions
 
     # Configure Nginx site according to HTTP/HTTPS protocol
     configure_nginx
 
-    if [[ -f "${PANEL_ROOT}/deploy/systemd/pteroq.service" ]]; then
-        cp "${PANEL_ROOT}/deploy/systemd/pteroq.service" /etc/systemd/system/pteroq.service
+    # Clean up legacy pteroq service if migrating from upstream Pterodactyl
+    if systemctl is-active --quiet pteroq.service 2>/dev/null; then
+        systemctl stop pteroq.service >> "${LOG_FILE}" 2>&1 || true
+    fi
+    if systemctl list-unit-files pteroq.service 2>/dev/null | grep -q "pteroq.service"; then
+        systemctl disable pteroq.service >> "${LOG_FILE}" 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/pteroq.service
+
+    if [[ -f "${PANEL_ROOT}/deploy/systemd/aquaq.service" ]]; then
+        cp "${PANEL_ROOT}/deploy/systemd/aquaq.service" /etc/systemd/system/aquaq.service
+    elif [[ -f "${PANEL_ROOT}/deploy/systemd/pteroq.service" ]]; then
+        cp "${PANEL_ROOT}/deploy/systemd/pteroq.service" /etc/systemd/system/aquaq.service
     else
-        cat > /etc/systemd/system/pteroq.service <<EOF
+        cat > /etc/systemd/system/aquaq.service <<EOF
 [Unit]
-Description=Pterodactyl Queue Worker
-After=redis-server.service
+Description=Aquadactyl Queue Worker
+After=network-online.target mariadb.service redis-server.service
+Wants=network-online.target
 
 [Service]
 User=${WEB_USER}
 Group=${WEB_GROUP}
+WorkingDirectory=${PANEL_ROOT}
+ExecStart=$(command -v php || echo "/usr/bin/php") ${PANEL_ROOT}/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3 --timeout=120 --max-time=3600
 Restart=always
-ExecStart=$(command -v php || echo "/usr/bin/php") ${PANEL_ROOT}/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
-StartLimitInterval=180
-StartLimitBurst=30
-RestartSec=5s
+RestartSec=5
+TimeoutStopSec=180
+KillSignal=SIGTERM
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
     fi
     run_silent "reload systemd" systemctl daemon-reload
-    systemctl enable --now pteroq.service >> "${LOG_FILE}" 2>&1 || log_warn "Could not immediately start pteroq.service."
+    systemctl enable --now aquaq.service >> "${LOG_FILE}" 2>&1 || log_warn "Could not immediately start aquaq.service."
 
     # Install standard Laravel / Pterodactyl cron schedule
     local php_bin
@@ -1416,6 +1436,10 @@ cmd_update() {
     MAINTENANCE_ENABLED=1
 
     if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet "${AQUAQ_SERVICE}"; then
+            systemctl stop "${AQUAQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
+            AQUAQ_WAS_RUNNING=1
+        fi
         if systemctl is-active --quiet "${PTEROQ_SERVICE}"; then
             systemctl stop "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
             PTEROQ_WAS_RUNNING=1
@@ -1509,8 +1533,8 @@ cmd_update() {
     build_frontend
     finish_deployment
 
-    if [[ "${PTEROQ_WAS_RUNNING}" -eq 1 ]]; then
-        systemctl start "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || log_warn "Failed to start ${PTEROQ_SERVICE}."
+    if [[ "${AQUAQ_WAS_RUNNING}" -eq 1 || "${PTEROQ_WAS_RUNNING}" -eq 1 ]]; then
+        systemctl start "${AQUAQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || log_warn "Failed to start ${AQUAQ_SERVICE}."
     fi
 
     artisan up >> "${LOG_FILE}" 2>&1 || true
@@ -1550,13 +1574,15 @@ cmd_remove() {
     # Step 1: Stop and disable background worker and cron
     show_progress "Stopping and Removing Services"
     if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet "${PTEROQ_SERVICE}" 2>/dev/null; then
-            run_silent "stop pteroq" systemctl stop "${PTEROQ_SERVICE}"
-        fi
-        if systemctl list-unit-files "${PTEROQ_SERVICE}" 2>/dev/null | grep -q "${PTEROQ_SERVICE}"; then
-            systemctl disable "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
-        fi
-        rm -f "/etc/systemd/system/${PTEROQ_SERVICE}"
+        for svc in "${AQUAQ_SERVICE}" "${PTEROQ_SERVICE}"; do
+            if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+                run_silent "stop ${svc}" systemctl stop "${svc}"
+            fi
+            if systemctl list-unit-files "${svc}" 2>/dev/null | grep -q "${svc}"; then
+                systemctl disable "${svc}" >> "${LOG_FILE}" 2>&1 || true
+            fi
+            rm -f "/etc/systemd/system/${svc}"
+        done
         run_silent "reload systemd" systemctl daemon-reload
     fi
     rm -f /etc/cron.d/aquadactyl
