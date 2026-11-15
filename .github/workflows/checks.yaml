@@ -1,0 +1,11 @@
+name: Installer checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash -n deploy.sh && bash tests/deploy.sh
+      - run: shellcheck --severity=error deploy.sh tests/deploy.sh tests/panel-smoke.sh

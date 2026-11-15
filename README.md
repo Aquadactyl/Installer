@@ -1,143 +1,108 @@
-# Aquadactyl Standalone Deployment & Management Tooling
+# Aquadactyl Installer
 
-A production-ready, single-file automation script for installing, updating, and managing **[Aquadactyl](https://aquadactyl.uk)** (Pterodactyl fork with bundled Blueprint beta-2026-08 integration).
+Git-based installation and managed updates for Aquadactyl v1.0-beta, with
+Blueprint included. This release is a prerelease; validate your deployment and
+addons in staging before opening it to users.
 
----
+## Install
 
-## ⚡ Quick Start (One-Liner)
-
-Run the full automated installation with a single command:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Aquadactyl/Installer/main/deploy.sh | sudo bash -s -- install
-```
-
-> **Note:** If `deploy.sh` is already downloaded locally on your server:
->
-> ```bash
-> sudo bash deploy.sh install
-> ```
-
----
-
-## 🖥️ Supported Operating Systems
-
-To ensure compatibility with modern PHP 8.5 runtimes and current build tooling, only modern distributions are supported:
-
-- **Ubuntu**: `24.04 LTS`, `24.10`, `26.04+ LTS`
-- **Debian**: `12 (Bookworm)`, `13 (Trixie)`
-
-_(Older releases such as Debian 11 or Ubuntu 22.04 and older are deprecated and unsupported)._
-
----
-
-## 🚀 What the Script Does
-
-### 1. Automated Host Provisioning (`setup-host`)
-
-- **PHP 8.5 & FPM**: Configures the official [Ondřej Surý](https://packages.sury.org/php/) Debian/Ubuntu repository with all required extensions (`bcmath`, `curl`, `gd`, `intl`, `mbstring`, `pdo_mysql`, `posix`, `redis`, `xml`, `zip`).
-- **Node.js & npm**: Idempotently installs NVM `v0.40.8`, Node.js `24`, and the latest `npm` (skips if Node $\ge$ 24 is already present).
-- **pnpm**: Installs the pinned `pnpm@12.10.1` package manager.
-- **Composer**: Installs Composer 2.
-- **Services**: Sets up MariaDB 10.11+, Redis 6+, Nginx, and system utilities (`rsync`, `flock`, `mariadb-client`, etc.).
-
-### 2. Panel Installation (`install`)
-
-- Clones Aquadactyl to `/var/www/aquadactyl`.
-- Configures `.env` with interactive terminal prompts (or pre-set environment variables).
-- Configures Redis drivers for sessions, caching, and queues.
-- Generates secure Laravel `APP_KEY` and 32-hex `HASHIDS_SALT`.
-- Automatically executes migrations, seeds Blueprint tables, and seeds default nests & eggs (`DatabaseSeeder`).
-- Headlessly bootstraps **Blueprint beta-2026-08** and warms its extension cache (`artisan bp:cache`).
-- Compiles production frontend assets (`pnpm run build:production`).
-- Deploys the background worker (`aquaq.service`) and the Laravel cron scheduler (`/etc/cron.d/aquadactyl`).
-- Normalizes strict least-privilege permissions (`root:www-data`, `0750`/`0640`, only `storage` and `bootstrap/cache` writable by `www-data`).
-- Guides you through creating your initial administrator account.
-
-### 3. Managed Zero-Downtime Updates (`update`)
-
-- **Tag-based upgrades**:
-
-  ```bash
-  sudo bash deploy.sh update v1.0.0
-  ```
-
-- **Local archive upgrades**:
-
-  ```bash
-  sudo bash deploy.sh update --archive /path/to/panel.tar.gz <sha256-hash>
-  ```
-
-- **Safety First**:
-  - Automatically creates a timestamped private backup (`/var/backups/aquadactyl/`) containing a full database SQL dump and compressed file snapshot.
-  - Pauses background queues (`aquaq.service`) and enters maintenance mode.
-  - Syncs the release archive while strictly preserving `.env`, `.blueprintrc`, and extension data.
-  - Re-applies all installed Blueprint extensions non-interactively.
-  - Traps failures: keeps maintenance mode active upon any error and outputs step-by-step recovery commands.
-
-### 4. Permissions Repair (`permissions`)
-
-Restore the strict Aquadactyl permission model at any time:
+Use a dedicated Ubuntu 24.04/26.04 LTS or Debian 12/13 host. You need root,
+working DNS, outbound HTTPS and enough disk space for a source build and backups.
+The script configures system packages and services on that host.
 
 ```bash
-sudo bash deploy.sh permissions
+git clone --depth 1 --branch v1.0-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+cd /opt/aquadactyl-installer
+sudo bash deploy.sh install v1.0-beta
 ```
 
-### 5. Complete Uninstallation / Revert (`remove`)
+Review `deploy.sh` before executing it. `install` selects the exact panel tag,
+sets up PHP 8.5/FPM (8.4 is supported), Composer 2, Node.js 24 and pinned pnpm,
+installs locked packages, generates missing application secrets, migrates the
+schema, initializes bundled Blueprint, builds assets and configures Nginx,
+`aquaq.service` and the minute scheduler. It prompts for panel/database settings
+and administrator creation. Existing initialized panels must use `update`.
 
-Cleanly uninstall Aquadactyl and revert system changes:
+Use a real HTTPS `APP_URL`. Obtain a trusted TLS certificate before going live;
+the initial self-signed certificate is only for bootstrapping. Set email delivery,
+then complete **Admin > Settings > Panel setup**. Configure trusted proxies when
+TLS terminates at Nginx, Traefik or Dokploy. Keep the database and Redis private.
+See the [panel deployment reference](https://github.com/Aquadactyl/aquadactyl/blob/main/docs/DEPLOYMENT.md)
+and [Manta installation](https://github.com/Aquadactyl/manta/blob/main/docs/INSTALLING.md).
+
+## Update
+
+Use a reviewed version of this installer, then select the published panel tag:
 
 ```bash
-sudo bash deploy.sh remove
+cd /opt/aquadactyl-installer
+sudo bash deploy.sh update v1.0-beta
 ```
 
-- Stops and disables background workers (`aquaq.service`) and removes the systemd unit.
-- Removes cron configuration `/etc/cron.d/aquadactyl`.
-- Removes the Nginx vhost (`/etc/nginx/sites-available/aquadactyl.conf`) and reloads Nginx.
-- Drops the MariaDB database and user credentials defined in `.env`.
-- Deletes the panel root (`/var/www/aquadactyl`).
-- Cleans up global binary symlinks (`blueprint`, `node`, `npm`, `pnpm`).
-- Prompts whether to optionally purge installed system packages (PHP, MariaDB, Redis, Nginx, NVM).
+To select a newer installer release first, use `git fetch origin tag VERSION`
+and `git checkout --detach VERSION` in this tools checkout. The panel source is
+fetched separately from the exact Git tag. Do not `git pull` over a live panel's
+addon-modified files. `.installed-commit` records Git update provenance.
 
----
+Updates have a maintenance window. Before replacing files the updater validates
+the source, requires every installed addon's original `.blueprint` package,
+stops active queues and creates private SQL/filesystem backups under
+`/var/backups/aquadactyl`. It preserves `.env`, keys, storage and addon state,
+removes obsolete core files, reinstalls locked dependencies and reapplies addons.
+An extension, build, migration or service failure leaves maintenance active.
 
-## ⚙️ Environment Variables
+Keep backups off-host and test restoring them. An update does not automatically
+reverse database migrations. For recovery, stop FPM/queues, restore the panel
+snapshot and SQL together, reinstall that version's dependencies, regenerate
+caches, then restart services and run `php artisan up` after verifying the panel.
 
-Customize deployment behavior without modifying the script:
-
-| Variable          | Default                   | Description                                                       |
-| :---------------- | :------------------------ | :---------------------------------------------------------------- |
-| `PANEL_ROOT`      | `/var/www/aquadactyl`     | Absolute directory path to the panel root.                        |
-| `WEB_USER`        | `www-data`                | System user executing PHP-FPM and web workers.                    |
-| `WEB_GROUP`       | `www-data`                | System group executing PHP-FPM and web workers.                   |
-| `PHP_VERSION`     | `8.5`                     | Target PHP minor version (`8.4` or `8.5`).                        |
-| `BACKUP_DIR`      | `/var/backups/aquadactyl` | Directory for update snapshots and SQL dumps.                     |
-| `NON_INTERACTIVE` | `0`                       | Set to `1` to bypass all terminal questions for CI/headless runs. |
-
----
-
-## 🛠️ Restoring a Backup
-
-If an update is interrupted or encounters an unrecoverable error, the script prints the exact backup path. You can restore your previous state with:
+For an independently downloaded release archive and reviewed SHA256:
 
 ```bash
-# 1. Stop services
-sudo systemctl stop php8.5-fpm aquaq.service
-
-# 2. Extract files
-sudo tar -xzf /var/backups/aquadactyl/<TIMESTAMP>/panel.tar.gz -C /var/www/aquadactyl
-
-# 3. Restore database
-sudo mariadb -u aquadactyl -p aquadactyl < /var/backups/aquadactyl/<TIMESTAMP>/database.sql
-
-# 4. Normalize permissions and start
-sudo bash /var/www/aquadactyl/deploy.sh permissions
-sudo systemctl start php8.5-fpm aquaq.service
-sudo -u www-data php /var/www/aquadactyl/artisan up
+sudo bash deploy.sh update --archive /path/to/panel.tar.gz YOUR_64_CHARACTER_SHA256
 ```
 
----
+## Configuration
 
-## 📄 License
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PANEL_ROOT` | `/var/www/aquadactyl` | Dedicated served panel directory |
+| `WEB_USER` / `WEB_GROUP` | `www-data` | PHP/queue user and readable code group |
+| `PHP_VERSION` | `8.5` | PHP CLI/FPM minor version for host setup |
+| `PHP_FPM_SERVICE` | autodetected | Service to reload after updating |
+| `BACKUP_DIR` | `/var/backups/aquadactyl` | Private backups outside the panel |
+| `NON_INTERACTIVE` | `0` | Use an already configured `.env`; no prompts |
 
-This tooling is licensed under the MIT License.
+Preconfigure `.env` in `PANEL_ROOT` for unattended deployment. Preserve `APP_KEY`
+and `HASHIDS_SALT` permanently. Never copy the local Docker example's credentials
+into a public installation. `sudo bash deploy.sh permissions` repairs the code
+ownership and writable directories. Logs use unique root-only files in `/var/log`.
+
+`setup-host` only provisions packages. The legacy `remove` command is destructive:
+it deletes panel data and can remove host services; it is not an update/rollback
+mechanism and should not be used on a shared host.
+
+## Validate changes
+
+```bash
+bash -n deploy.sh
+bash tests/deploy.sh
+shellcheck --severity=error deploy.sh tests/deploy.sh
+```
+
+These checks exercise release pinning, tag/path validation and dotenv handling
+in temporary directories. Full installation also requires a disposable Linux
+host and real database, queue, web server and Blueprint checks.
+
+With a panel checkout beside this repository, test the application installation
+and Git update with real MariaDB, Redis, Composer, pnpm and Blueprint:
+
+```bash
+docker compose -f tests/compose.yaml run --build --rm panel
+docker compose -f tests/compose.yaml down
+```
+
+This stack publishes no ports and mounts no Docker socket. It verifies keys,
+uploads, addon data, SQL backups, obsolete-file removal and the login HTTP page.
+Systemd/FPM calls are stubbed in this test image; validate actual host services
+and trusted HTTPS on a disposable Linux host too. Reports stay in ignored `build/`.

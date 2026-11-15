@@ -8,7 +8,7 @@
 # Supported Commands:
 #   sudo bash deploy.sh setup-host      # Full automated OS provisioning & packages
 #   sudo bash deploy.sh install         # Full panel manual install automation
-#   sudo bash deploy.sh update <vTag>   # Managed zero-downtime update
+#   sudo bash deploy.sh update <vTag>   # Managed update with a maintenance window
 #   sudo bash deploy.sh update --archive /path/to/panel.tar.gz <sha256>
 #   sudo bash deploy.sh permissions     # Restore strict least-privilege permissions
 #
@@ -32,7 +32,8 @@ BACKUP_DIR="${BACKUP_DIR:-/var/backups/aquadactyl}"
 BLUEPRINT_ENVIRONMENT="${BLUEPRINT_ENVIRONMENT:-ci}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 REPO_URL="${REPO_URL:-https://github.com/Aquadactyl/aquadactyl.git}"
-DEFAULT_PINNED_PNPM="12.10.1"
+DEFAULT_PINNED_PNPM="12.15.0"
+RELEASE_TAG="${RELEASE_TAG:-v1.0-beta}"
 
 # Internal tracking
 WORK=""
@@ -42,6 +43,7 @@ LOCK_ACQUIRED=0
 MAINTENANCE_ENABLED=0
 AQUAQ_WAS_RUNNING=0
 PTEROQ_WAS_RUNNING=0
+BLUEPRINT_WAS_RUNNING=0
 
 # Standard POSIX / sysexits exit codes
 EX_OK=0
@@ -103,7 +105,13 @@ show_progress() {
 }
 
 # Silent command runner with live terminal animation spinner
-LOG_FILE="/tmp/aquadactyl-deploy.log"
+LOG_FILE=""
+initialize_log() {
+    # Never append privileged output to a predictable file in a shared directory.
+    umask 077
+    LOG_FILE="$(mktemp "${1:-/var/log}/aquadactyl-deploy-XXXXXXXX.log")"
+    chmod 0600 "${LOG_FILE}"
+}
 run_silent() {
     local cmd_desc="${1:-Executing task}"
     shift
@@ -212,7 +220,9 @@ cleanup_and_handle_failure() {
     exit "${exit_code}"
 }
 
-trap 'cleanup_and_handle_failure $? $LINENO' EXIT HUP INT QUIT TERM
+trap 'cleanup_and_handle_failure $? $LINENO' EXIT
+trap 'exit 130' HUP INT QUIT
+trap 'exit 143' TERM
 
 # ------------------------------------------------------------------------------
 # 3. Helpers & Semantic Versioning
@@ -226,6 +236,56 @@ semver_ge() {
     local lowest
     lowest="$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | head -n1)"
     [[ "$lowest" == "$v2" ]]
+}
+
+validate_release_tag() {
+    [[ ${#1} -le 100 && "$1" =~ ^v(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){0,2}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || {
+        log_fatal "Use a versioned release tag, for example v1.0-beta."
+        return "${EX_USAGE}"
+    }
+}
+
+validate_panel_root() {
+    PANEL_ROOT="$(realpath -m "${PANEL_ROOT}")"
+    case "${PANEL_ROOT}" in
+        /|/var|/var/www|/etc|/usr|/home|/root|/opt|/srv|/tmp)
+            log_fatal "PANEL_ROOT must be a dedicated panel directory."
+            return "${EX_DATAERR}"
+            ;;
+    esac
+    [[ "${PANEL_ROOT}" =~ ^/[a-zA-Z0-9_./-]+$ ]] || return "${EX_DATAERR}"
+}
+
+set_env_value() {
+    local key="$1" value="$2"
+    [[ "${key}" =~ ^[A-Z_]+$ && "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || return "${EX_DATAERR}"
+    # Quote dotenv values as data, including $, #, &, quotes and backslashes.
+    ENV_KEY="${key}" ENV_VALUE="${value}" php -r '
+        $path = ".env";
+        $key = getenv("ENV_KEY");
+        $value = "\"" . str_replace(["\\", "\"", "$"], ["\\\\", "\\\"", "\\$"], getenv("ENV_VALUE")) . "\"";
+        $lines = file($path, FILE_IGNORE_NEW_LINES);
+        $found = false;
+        foreach ($lines as &$line) {
+            if (str_starts_with($line, $key . "=")) { $line = $key . "=" . $value; $found = true; }
+        }
+        if (!$found) { $lines[] = $key . "=" . $value; }
+        if (file_put_contents($path, implode("\n", $lines) . "\n") === false) { exit(1); }
+    '
+}
+
+dotenv_value() {
+    php -r 'require "vendor/autoload.php"; $values = Dotenv\Dotenv::parse(file_get_contents(".env")); echo $values[$argv[1]] ?? "";' "$1"
+}
+
+fetch_git_release() {
+    local tag="$1" destination="$2"
+    validate_release_tag "${tag}"
+    git init --bare "${destination}/source.git" >/dev/null
+    git -C "${destination}/source.git" remote add origin "${REPO_URL}"
+    git -C "${destination}/source.git" fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+    git -C "${destination}/source.git" archive --format=tar.gz "refs/tags/${tag}" > "${destination}/panel.tar.gz"
+    git -C "${destination}/source.git" rev-parse "refs/tags/${tag}^{commit}" > "${destination}/source-commit"
 }
 
 validate_os() {
@@ -251,9 +311,8 @@ validate_os() {
             fi
             ;;
         ubuntu)
-            # Supported: Ubuntu 24.04/24.10, Ubuntu 26.04
-            local ubuntu_major="${os_version_id%%.*}"
-            if [[ "${ubuntu_major}" == "24" || "${ubuntu_major}" == "26" ]]; then
+            # Only supported LTS releases, never an EOL interim release.
+            if [[ "${os_version_id}" == "24.04" || "${os_version_id}" == "26.04" ]]; then
                 is_supported=1
             fi
             ;;
@@ -287,52 +346,15 @@ enforce_root_and_utf8() {
     export DEBIAN_FRONTEND="noninteractive"
     export NEEDRESTART_MODE="a"
 
-    # 3. Enforce UTF-8 in .bashrc for root and default user if present
-    local bashrc_targets=("/root/.bashrc")
-    [[ -n "${HOME:-}" && -f "${HOME}/.bashrc" && "${HOME}" != "/root" ]] && bashrc_targets+=("${HOME}/.bashrc")
-
-    for brc in "${bashrc_targets[@]}"; do
-        if [[ -f "${brc}" ]]; then
-            local modified=0
-            if ! grep -q "LC_ALL=.*UTF-8" "${brc}"; then
-                echo 'export LC_ALL="C.UTF-8"' >> "${brc}"
-                modified=1
-            fi
-            if ! grep -q "LANG=.*UTF-8" "${brc}"; then
-                echo 'export LANG="C.UTF-8"' >> "${brc}"
-                modified=1
-            fi
-            # Source bashrc to apply changes immediately
-            if [[ "${modified}" -eq 1 ]]; then
-                # shellcheck source=/dev/null
-                \. "${brc}" 2>/dev/null || true
-            fi
-        else
-            echo 'export LC_ALL="C.UTF-8"' > "${brc}"
-            echo 'export LANG="C.UTF-8"' >> "${brc}"
-            # shellcheck source=/dev/null
-            \. "${brc}" 2>/dev/null || true
-        fi
-    done
+    validate_panel_root
 }
 
 ensure_apt_unlocked() {
-    # Check if any lingering apt or dpkg processes are holding locks from an interrupted session
-    local stale_pids=""
-    if command -v pgrep >/dev/null 2>&1; then
-        stale_pids="$(pgrep -f "apt-get|dpkg" 2>/dev/null || true)"
-    fi
-    if [[ -n "${stale_pids}" ]]; then
-        log_warn "Lingering apt/dpkg process(es) detected. Terminating them to release locks..."
-        for p in ${stale_pids}; do
-            if [[ "${p}" != "$$" && "${p}" != "${PPID}" ]]; then
-                kill -9 "${p}" 2>/dev/null || true
-            fi
-        done
-        sleep 1
-    fi
-    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
-    dpkg --configure -a >> "${LOG_FILE}" 2>&1 || true
+    # APT waits for its own lock. Killing package managers or unlinking their
+    # lock files can corrupt a host being updated by unattended-upgrades.
+    [[ -n "${WORK}" ]] || WORK="$(mktemp -d -t aquadactyl-host-XXXXXX)"
+    export APT_CONFIG="${WORK}/apt.conf"
+    printf 'DPkg::Lock::Timeout "300";\n' > "${APT_CONFIG}"
 }
 
 detect_php_fpm() {
@@ -422,11 +444,11 @@ preflight() {
         exit "${EX_UNAVAILABLE}"
     fi
 
-    # Validate Node.js version >= 22.13.0
+    # Match the panel's current engine floor.
     local node_ver
     node_ver="$(node -v 2>/dev/null | sed 's/^v//' || echo "0.0.0")"
-    if ! semver_ge "${node_ver}" "22.13.0"; then
-        log_fatal "Unsupported Node.js version (v${node_ver}). Minimum required is >= 22.13.0."
+    if ! semver_ge "${node_ver}" "24.22.1"; then
+        log_fatal "Unsupported Node.js version (v${node_ver}). Minimum required is >= 24.22.1."
         exit "${EX_UNAVAILABLE}"
     fi
 
@@ -438,7 +460,7 @@ preflight() {
         current_pnpm="$(pnpm -v 2>/dev/null || echo "")"
         if [[ -n "${current_pnpm}" && "${current_pnpm}" != "${pinned_pnpm}" ]]; then
             log_warn "Installed pnpm (${current_pnpm}) does not match pinned version (${pinned_pnpm}). Re-installing pinned pnpm..."
-            npm install --global "pnpm@${pinned_pnpm}" || true
+            npm install --global "pnpm@${pinned_pnpm}"
         fi
     fi
 
@@ -448,6 +470,10 @@ preflight() {
     fi
     if ! getent group "${WEB_GROUP}" >/dev/null 2>&1; then
         log_fatal "Configured WEB_GROUP '${WEB_GROUP}' does not exist on the host system."
+        exit "${EX_UNAVAILABLE}"
+    fi
+    if ! runuser -u "${WEB_USER}" -- node --version >/dev/null 2>&1; then
+        log_fatal "Node.js must be executable by ${WEB_USER}; install it outside a private root/NVM home directory."
         exit "${EX_UNAVAILABLE}"
     fi
 
@@ -479,6 +505,7 @@ permissions() {
 
     # Source files owned by root:www-data
     chown -R "root:${WEB_GROUP}" "${PANEL_ROOT}"
+    chmod 0750 "${PANEL_ROOT}"
 
     # Default: dirs 0750, files 0640 (excluding node_modules and .git)
     find "${PANEL_ROOT}" -mindepth 1 \
@@ -513,6 +540,17 @@ permissions() {
     find "${PANEL_ROOT}/storage" "${PANEL_ROOT}/bootstrap/cache" -type d -exec chmod 0750 {} +
     find "${PANEL_ROOT}/storage" "${PANEL_ROOT}/bootstrap/cache" -type f -exec chmod 0640 {} +
 
+    # ExtensionFS holds addon data, never executable addon source. Preserve its
+    # writable ownership just as Blueprint's own lifecycle command does.
+    if [[ -d "${PANEL_ROOT}/.blueprint/extensions" ]]; then
+        local extension_fs
+        while IFS= read -r -d '' extension_fs; do
+            chown -R "${WEB_USER}:${WEB_GROUP}" "${extension_fs}"
+            find "${extension_fs}" -type d -exec chmod 0750 {} +
+            find "${extension_fs}" -type f -exec chmod 0640 {} +
+        done < <(find "${PANEL_ROOT}/.blueprint/extensions" -mindepth 2 -maxdepth 2 -type d -name fs -print0)
+    fi
+
     # Enforce strict permissions on .env
     if [[ -f "${PANEL_ROOT}/.env" ]]; then
         chown "root:${WEB_GROUP}" "${PANEL_ROOT}/.env"
@@ -543,7 +581,6 @@ dependencies() {
     # Node packages
     log_info "Installing frontend dependencies via pnpm..."
     run_silent "pnpm install" pnpm install --frozen-lockfile
-    run_silent "npm allow-scripts=pnpm" npm config set allow-scripts=pnpm --location=user || true
 
     permissions
 
@@ -638,7 +675,8 @@ configure_nginx() {
     [[ "${app_url}" =~ ^https:// ]] && is_https=1
 
     domain_name="$(echo "${app_url}" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:[0-9]*$||')"
-    [[ -z "${domain_name}" || "${domain_name}" == "panel.example.com" ]] && domain_name="_"
+    [[ "${domain_name}" =~ ^[a-zA-Z0-9.-]+$ ]] || { log_fatal "Invalid panel hostname."; exit "${EX_DATAERR}"; }
+    [[ "${domain_name}" != panel.example.com ]] || { log_fatal "Configure your real APP_URL before installing."; exit "${EX_DATAERR}"; }
 
     local fpm_sock="/run/php/php${PHP_VERSION}-fpm.sock"
     [[ ! -e "${fpm_sock}" && -e "/run/php/php8.5-fpm.sock" ]] && fpm_sock="/run/php/php8.5-fpm.sock"
@@ -790,7 +828,8 @@ EOF
     # Disable default nginx site and enable aquadactyl
     rm -f /etc/nginx/sites-enabled/default
     ln -sf "${target_conf}" /etc/nginx/sites-enabled/aquadactyl.conf
-    nginx -t >> "${LOG_FILE}" 2>&1 && systemctl reload nginx >> "${LOG_FILE}" 2>&1 || systemctl restart nginx >> "${LOG_FILE}" 2>&1 || true
+    nginx -t >> "${LOG_FILE}" 2>&1
+    systemctl reload nginx >> "${LOG_FILE}" 2>&1
 }
 
 finish_deployment() {
@@ -804,12 +843,12 @@ finish_deployment() {
     run_silent "artisan config:cache" artisan config:cache
     run_silent "artisan route:cache" artisan route:cache
     run_silent "artisan view:cache" artisan view:cache
-    run_silent "artisan queue:restart" artisan queue:restart || true
+    run_silent "artisan queue:restart" artisan queue:restart
 
     detect_php_fpm
     if command -v systemctl >/dev/null 2>&1; then
         log_info "Reloading PHP-FPM service (${PHP_FPM_SERVICE})..."
-        systemctl reload "${PHP_FPM_SERVICE}" >> "${LOG_FILE}" 2>&1 || systemctl restart "${PHP_FPM_SERVICE}" >> "${LOG_FILE}" 2>&1 || log_warn "Could not reload ${PHP_FPM_SERVICE}."
+        systemctl reload "${PHP_FPM_SERVICE}" >> "${LOG_FILE}" 2>&1 || systemctl restart "${PHP_FPM_SERVICE}" >> "${LOG_FILE}" 2>&1
     fi
 
     log_ok "Deployment completed."
@@ -840,11 +879,16 @@ cmd_setup_host() {
     run_silent "apt-get update" apt-get update
     run_silent "apt-get install base packages" apt-get install -y lsb-release ca-certificates curl apt-transport-https gnupg
 
-    log_info "Adding Sury PHP repository (Debian & Ubuntu)..."
-    run_silent "download sury keyring" curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
-    run_silent "install sury keyring" dpkg -i /tmp/debsuryorg-archive-keyring.deb
-    rm -f /tmp/debsuryorg-archive-keyring.deb
-    sh -c 'echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list'
+    local os_id
+    os_id="$(. /etc/os-release && echo "${ID}")"
+    if [[ "${os_id}" == ubuntu ]]; then
+        run_silent "install repository tools" apt-get install -y software-properties-common
+        run_silent "add Ubuntu PHP repository" add-apt-repository -y ppa:ondrej/php
+    else
+        run_silent "download sury keyring" curl -fSsL -o "${WORK}/keyring.deb" https://packages.sury.org/debsuryorg-archive-keyring.deb
+        run_silent "install sury keyring" dpkg -i "${WORK}/keyring.deb"
+        printf 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ %s main\n' "$(lsb_release -sc)" > /etc/apt/sources.list.d/php.list
+    fi
     run_silent "apt-get update (sury)" apt-get update
 
     log_info "Installing PHP ${PHP_VERSION}, MariaDB, Nginx, Redis, zip, and system tools..."
@@ -853,7 +897,7 @@ cmd_setup_host() {
         "php${PHP_VERSION}-mysql" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-bcmath" \
         "php${PHP_VERSION}-xml" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-zip" "php${PHP_VERSION}-posix" \
         "php${PHP_VERSION}-intl" "php${PHP_VERSION}-redis" \
-        mariadb-server mariadb-client nginx redis-server cron git tar zip unzip rsync util-linux certbot python3-certbot-nginx
+        mariadb-server mariadb-client nginx redis-server cron git tar zip unzip rsync util-linux xz-utils certbot python3-certbot-nginx
 
     if command -v systemctl >/dev/null 2>&1; then
         systemctl enable --now cron >> "${LOG_FILE}" 2>&1 || systemctl enable --now crond >> "${LOG_FILE}" 2>&1 || true
@@ -862,48 +906,40 @@ cmd_setup_host() {
     # Install Composer 2 if not already present
     if ! command -v composer >/dev/null 2>&1; then
         log_info "Installing Composer 2..."
-        run_silent "install composer" sh -c "curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer"
+        local composer_checksum
+        composer_checksum="$(curl -fSsL https://composer.github.io/installer.sig)"
+        [[ "${composer_checksum}" =~ ^[a-f0-9]{96}$ ]] || exit "${EX_DATAERR}"
+        curl -fSsL https://getcomposer.org/installer -o "${WORK}/composer-setup.php"
+        [[ "$(sha384sum "${WORK}/composer-setup.php" | awk '{print $1}')" == "${composer_checksum}" ]] || {
+            log_fatal "Composer installer checksum mismatch."
+            exit "${EX_DATAERR}"
+        }
+        run_silent "install composer" php "${WORK}/composer-setup.php" --2 --install-dir=/usr/local/bin --filename=composer
     else
         log_ok "Composer is already installed ($(composer --version 2>/dev/null | head -n1)). Skipping."
     fi
 
-    # Check if Node.js >= 24 is already installed
-    local existing_node_ver=""
-    if command -v node >/dev/null 2>&1; then
-        existing_node_ver="$(node -v | sed 's/^v//')"
-    fi
-
-    if [[ -n "${existing_node_ver}" ]] && semver_ge "${existing_node_ver}" "24.0.0"; then
-        log_ok "Node.js v${existing_node_ver} (>= 24.0.0) is already installed. Skipping Node installation."
-    else
-        log_info "Installing NVM v0.40.8 and Node.js 24..."
-        run_silent "install nvm" sh -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash"
-
-        # In lieu of restarting the shell
-        if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
-            # shellcheck source=/dev/null
-            \. "${HOME}/.nvm/nvm.sh"
-        elif [[ -s "/root/.nvm/nvm.sh" ]]; then
-            # shellcheck source=/dev/null
-            \. "/root/.nvm/nvm.sh"
-        fi
-
-        # Download and install Node.js:
-        run_silent "nvm install 24" nvm install 24
-        nvm use 24 >> "${LOG_FILE}" 2>&1 || true
-
-        # Update npm to latest version
-        log_info "Updating npm to latest version..."
-        run_silent "npm update" npm i -g npm@latest
-
-        # Make Node & npm available system-wide for all users (e.g., www-data)
-        local nvm_bin_dir
-        nvm_bin_dir="$(dirname "$(command -v node)")"
-        if [[ -n "${nvm_bin_dir}" && -d "${nvm_bin_dir}" ]]; then
-            ln -sf "${nvm_bin_dir}/node" /usr/local/bin/node
-            ln -sf "${nvm_bin_dir}/npm" /usr/local/bin/npm
-            ln -sf "${nvm_bin_dir}/npx" /usr/local/bin/npx
-        fi
+    local existing_node_ver="0.0.0"
+    if command -v node >/dev/null 2>&1; then existing_node_ver="$(node -v | sed 's/^v//')"; fi
+    if ! semver_ge "${existing_node_ver}" "24.22.1"; then
+        local node_arch node_file node_dir
+        case "$(uname -m)" in
+            x86_64) node_arch=x64 ;;
+            aarch64|arm64) node_arch=arm64 ;;
+            *) log_fatal "Node automatic setup supports amd64 and arm64."; exit "${EX_UNAVAILABLE}" ;;
+        esac
+        [[ -n "${WORK}" ]] || WORK="$(mktemp -d -t aquadactyl-host-XXXXXX)"
+        curl -fSsL https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt -o "${WORK}/node-shasums"
+        node_file="$(awk -v suffix="-linux-${node_arch}.tar.xz" 'substr($2,length($2)-length(suffix)+1)==suffix { print $2 }' "${WORK}/node-shasums")"
+        [[ "${node_file}" =~ ^node-v24\.[0-9]+\.[0-9]+-linux-(x64|arm64)\.tar\.xz$ ]] || exit "${EX_DATAERR}"
+        curl -fSsL "https://nodejs.org/dist/latest-v24.x/${node_file}" -o "${WORK}/${node_file}"
+        (cd "${WORK}" && grep -F "  ${node_file}" node-shasums | sha256sum --check --status)
+        node_dir="/usr/local/lib/nodejs/${node_file%.tar.xz}"
+        mkdir -p "${node_dir}"
+        tar -xJf "${WORK}/${node_file}" --strip-components=1 -C "${node_dir}"
+        for tool in node npm npx; do ln -sfn "${node_dir}/bin/${tool}" "/usr/local/bin/${tool}"; done
+        export PATH="/usr/local/bin:${PATH}"
+        hash -r
     fi
 
     # Check if pnpm is already installed matching pinned version
@@ -924,9 +960,6 @@ cmd_setup_host() {
         fi
     fi
 
-    # Allow pnpm lifecycle scripts
-    run_silent "npm allow-scripts=pnpm" npm config set allow-scripts=pnpm --location=user || true
-
     log_ok "Host packages installed successfully."
 }
 
@@ -937,6 +970,13 @@ cmd_install() {
     echo -e "${CLR_CYAN}${CLR_BOLD}=== Aquadactyl Panel Full Automated Installation ===${CLR_RESET}"
 
     enforce_root_and_utf8
+    [[ $# -le 1 ]] || { log_fatal "Usage: deploy.sh install [v1.0-beta]"; exit "${EX_USAGE}"; }
+    RELEASE_TAG="${1:-${RELEASE_TAG}}"
+    validate_release_tag "${RELEASE_TAG}"
+    if [[ -f "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/is_installed" || -d "${PANEL_ROOT}/vendor" ]]; then
+        log_fatal "An existing panel was found. Use deploy.sh update ${RELEASE_TAG}; install never reprovisions an existing database."
+        exit "${EX_DATAERR}"
+    fi
 
     TOTAL_STEPS=10
     CURRENT_STEP=0
@@ -956,7 +996,12 @@ cmd_install() {
         log_info "Preparing panel directory at ${PANEL_ROOT}..."
         mkdir -p "${PANEL_ROOT}"
         if [[ -z "$(ls -A "${PANEL_ROOT}")" ]]; then
-            run_silent "cloning repository" git clone "${REPO_URL}" "${PANEL_ROOT}"
+            run_silent "cloning release ${RELEASE_TAG}" git clone --depth=1 --branch "${RELEASE_TAG}" -- "${REPO_URL}" "${PANEL_ROOT}"
+        elif [[ -f "${PANEL_ROOT}/.env" && -z "$(find "${PANEL_ROOT}" -mindepth 1 -maxdepth 1 ! -name .env -print -quit)" ]]; then
+            WORK="$(mktemp -d -t aquadactyl-install-XXXXXX)"
+            run_silent "cloning release ${RELEASE_TAG}" git clone --depth=1 --branch "${RELEASE_TAG}" -- "${REPO_URL}" "${WORK}/release"
+            rsync -a --exclude='.git/' --exclude='.env' "${WORK}/release/" "${PANEL_ROOT}/"
+            git -C "${WORK}/release" rev-parse HEAD > "${PANEL_ROOT}/.installed-commit"
         else
             log_fatal "${PANEL_ROOT} exists and is not empty, but does not contain a valid Aquadactyl repository."
             exit "${EX_DATAERR}"
@@ -964,6 +1009,11 @@ cmd_install() {
     fi
 
     cd "${PANEL_ROOT}"
+
+    if ! grep -Fq "    'version' => '${RELEASE_TAG#v}'," config/app.php; then
+        log_fatal "The source directory does not match ${RELEASE_TAG}. Start from its Git tag, or use update for an existing panel."
+        exit "${EX_DATAERR}"
+    fi
 
     # Step 3: Configure Environment (.env)
     show_progress "Configuring Environment (.env)"
@@ -993,38 +1043,40 @@ cmd_install() {
             if [[ "${tty_in}" == "/dev/tty" ]]; then
                 read -rp "Enter Panel Domain/URL [https://panel.example.com]: " input_url < /dev/tty
                 input_url="${input_url:-https://panel.example.com}"
-                sed -i "s|^APP_URL=.*|APP_URL=${input_url}|" .env
+                [[ "${input_url}" =~ ^https?://[a-zA-Z0-9.-]+(:[0-9]+)?/?$ ]] || { log_fatal "Enter a valid HTTP(S) panel origin."; exit "${EX_DATAERR}"; }
+                set_env_value APP_URL "${input_url}"
 
                 read -rp "Enter Database Name [panel]: " input_dbname < /dev/tty
                 input_dbname="${input_dbname:-panel}"
-                sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${input_dbname}|" .env
+                set_env_value DB_DATABASE "${input_dbname}"
 
                 read -rp "Enter Database User [aquadactyl]: " input_dbuser < /dev/tty
                 input_dbuser="${input_dbuser:-aquadactyl}"
-                sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${input_dbuser}|" .env
+                set_env_value DB_USERNAME "${input_dbuser}"
 
                 read -rsp "Enter Database Password (leave empty to auto-generate): " input_dbpass < /dev/tty
                 echo ""
                 if [[ -n "${input_dbpass}" ]]; then
-                    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${input_dbpass}|" .env
+                    set_env_value DB_PASSWORD "${input_dbpass}"
                 fi
             else
                 read -rp "Enter Panel Domain/URL [https://panel.example.com]: " input_url
                 input_url="${input_url:-https://panel.example.com}"
-                sed -i "s|^APP_URL=.*|APP_URL=${input_url}|" .env
+                [[ "${input_url}" =~ ^https?://[a-zA-Z0-9.-]+(:[0-9]+)?/?$ ]] || { log_fatal "Enter a valid HTTP(S) panel origin."; exit "${EX_DATAERR}"; }
+                set_env_value APP_URL "${input_url}"
 
                 read -rp "Enter Database Name [panel]: " input_dbname
                 input_dbname="${input_dbname:-panel}"
-                sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${input_dbname}|" .env
+                set_env_value DB_DATABASE "${input_dbname}"
 
                 read -rp "Enter Database User [aquadactyl]: " input_dbuser
                 input_dbuser="${input_dbuser:-aquadactyl}"
-                sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${input_dbuser}|" .env
+                set_env_value DB_USERNAME "${input_dbuser}"
 
                 read -rsp "Enter Database Password (leave empty to auto-generate): " input_dbpass
                 echo ""
                 if [[ -n "${input_dbpass}" ]]; then
-                    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${input_dbpass}|" .env
+                    set_env_value DB_PASSWORD "${input_dbpass}"
                 fi
             fi
 
@@ -1071,35 +1123,6 @@ cmd_install() {
     db_user="$(grep -E '^DB_USERNAME=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "aquadactyl")"
     db_pass="$(grep -E '^DB_PASSWORD=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "")"
 
-    # Automated MariaDB provisioning
-    local db_client=""
-    if command -v mariadb >/dev/null 2>&1; then
-        db_client="mariadb"
-    elif command -v mysql >/dev/null 2>&1; then
-        db_client="mysql"
-    fi
-
-    if [[ -n "${db_client}" ]]; then
-        "${db_client}" -u root -e "
-            CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
-
-            DROP USER IF EXISTS '${db_user}'@'127.0.0.1';
-            DROP USER IF EXISTS '${db_user}'@'localhost';
-            DROP USER IF EXISTS '${db_user}'@'%';
-
-            CREATE USER '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
-            GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1' WITH GRANT OPTION;
-
-            CREATE USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
-            GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost' WITH GRANT OPTION;
-
-            CREATE USER '${db_user}'@'%' IDENTIFIED BY '${db_pass}';
-            GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'%' WITH GRANT OPTION;
-
-            FLUSH PRIVILEGES;
-        " >> "${LOG_FILE}" 2>&1 || true
-    fi
-
     # Step 4: Preflight checks & Locking
     show_progress "Validating System & Concurrency Lock"
     preflight
@@ -1113,6 +1136,35 @@ cmd_install() {
     # Step 5: Install dependencies
     show_progress "Installing Composer & PNPM Dependencies"
     dependencies
+
+    # Provision only a local database. Never drop existing users, grant remote
+    # access, or interpolate unvalidated identifiers into SQL.
+    db_name="$(dotenv_value DB_DATABASE)"
+    db_user="$(dotenv_value DB_USERNAME)"
+    db_pass="$(dotenv_value DB_PASSWORD)"
+    db_host="$(dotenv_value DB_HOST)"
+    local db_client=""
+    if command -v mariadb >/dev/null 2>&1; then
+        db_client="mariadb"
+    elif command -v mysql >/dev/null 2>&1; then
+        db_client="mysql"
+    fi
+
+    if [[ -n "${db_client}" && "${db_host}" == "127.0.0.1" ]]; then
+        [[ "${db_name}" =~ ^[a-zA-Z0-9_]+$ && "${db_user}" =~ ^[a-zA-Z0-9_]+$ ]] || {
+            log_fatal "Local database name and user may contain only letters, digits and underscores."
+            exit "${EX_DATAERR}"
+        }
+        local sql_password
+        sql_password="${db_pass//\\/\\\\}"
+        sql_password="${sql_password//\'/\'\'}"
+        "${db_client}" -u root -e "
+            CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
+            CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${sql_password}';
+            GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1';
+        " >> "${LOG_FILE}" 2>&1
+    fi
+
 
     # Step 6: Generate Encryption Keys and Salt
     show_progress "Generating Application Keys & Hashids Salt"
@@ -1202,7 +1254,7 @@ WantedBy=multi-user.target
 EOF
     fi
     run_silent "reload systemd" systemctl daemon-reload
-    systemctl enable --now aquaq.service >> "${LOG_FILE}" 2>&1 || log_warn "Could not immediately start aquaq.service."
+    systemctl enable --now aquaq.service >> "${LOG_FILE}" 2>&1
 
     # Install standard Laravel / Pterodactyl cron schedule
     local php_bin
@@ -1227,7 +1279,7 @@ EOF
     show_progress "Finalizing Production Caches"
     finish_deployment
 
-    artisan up >> "${LOG_FILE}" 2>&1 || true
+    artisan up >> "${LOG_FILE}" 2>&1
     MAINTENANCE_ENABLED=0
 
     # Step 12: Administrative user creation
@@ -1278,8 +1330,9 @@ cmd_update() {
                 exit "${EX_OK}"
                 ;;
             v*)
-                mode="release"
+                mode="git"
                 release_tag="$1"
+                validate_release_tag "${release_tag}"
                 if [[ $# -ge 2 && ! "$2" =~ ^- ]]; then
                     repo_owner="$2"
                     shift
@@ -1312,26 +1365,14 @@ cmd_update() {
 
     # Step 2: Retrieve & Verify Release Archive
     show_progress "Downloading & Verifying Release Archive"
-    if [[ "${mode}" == "release" ]]; then
-        log_info "Fetching release '${release_tag}' from '${repo_owner}'..."
-        local tarball_url="https://github.com/${repo_owner}/releases/download/${release_tag}/panel.tar.gz"
-        local checksums_url="https://github.com/${repo_owner}/releases/download/${release_tag}/SHA256SUMS"
-
-        run_silent "download panel.tar.gz" curl -fSL "${tarball_url}" -o "${WORK}/panel.tar.gz" || {
-            log_fatal "Failed to download panel archive from: ${tarball_url}"
-            exit "${EX_GENERAL}"
-        }
-
-        run_silent "download SHA256SUMS" curl -fSL "${checksums_url}" -o "${WORK}/SHA256SUMS" || {
-            log_fatal "Failed to download SHA256SUMS from: ${checksums_url}"
-            exit "${EX_GENERAL}"
-        }
-
-        expected_hash="$(grep "panel.tar.gz" "${WORK}/SHA256SUMS" | awk '{print $1}' || echo "")"
-        if [[ -z "${expected_hash}" ]]; then
-            log_fatal "Unable to locate panel.tar.gz checksum in SHA256SUMS."
-            exit "${EX_DATAERR}"
+    if [[ "${mode}" == "git" ]]; then
+        validate_release_tag "${release_tag}"
+        [[ "${repo_owner}" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]] || exit "${EX_USAGE}"
+        if [[ "${repo_owner}" != Aquadactyl/aquadactyl ]]; then
+            REPO_URL="https://github.com/${repo_owner}.git"
         fi
+        run_silent "fetch Git release ${release_tag}" fetch_git_release "${release_tag}" "${WORK}"
+        expected_hash="$(sha256sum "${WORK}/panel.tar.gz" | awk '{print $1}')"
     elif [[ "${mode}" == "archive" ]]; then
         if [[ ! -f "${archive_path}" ]]; then
             log_fatal "Archive file not found: ${archive_path}"
@@ -1378,7 +1419,6 @@ cmd_update() {
         "package.json"
         "composer.lock"
         "pnpm-lock.yaml"
-        "pnpm-workspace.yaml"
         ".blueprint/extensions/blueprint/private/extensionfs.php"
     )
     for crf in "${required_release_files[@]}"; do
@@ -1387,6 +1427,10 @@ cmd_update() {
             exit "${EX_DATAERR}"
         fi
     done
+
+    if [[ -f "${WORK}/source-commit" ]]; then
+        cp "${WORK}/source-commit" "${WORK}/release/.installed-commit"
+    fi
 
     # Step 4: Extension Inventory Pre-flight
     show_progress "Auditing Installed Blueprint Extensions"
@@ -1403,19 +1447,17 @@ cmd_update() {
     if [[ ${#extensions[@]} -gt 0 ]]; then
         log_info "Detected installed Blueprint extensions: ${extensions[*]}"
         for ext in "${extensions[@]}"; do
+            [[ "${ext}" =~ ^[a-zA-Z0-9_-]+$ && "${ext}" != blueprint ]] || {
+                log_fatal "Invalid installed extension identifier."
+                exit "${EX_DATAERR}"
+            }
             local found=0
             if [[ -f "${PANEL_ROOT}/${ext}.blueprint" || -f "${PANEL_ROOT}/.blueprint/extensions/${ext}/build/${ext}.blueprint" ]]; then
                 found=1
             fi
             if [[ "${found}" -eq 0 ]]; then
-                log_warn "Archive package for extension '${ext}' was not found on disk."
-                if [[ "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" ]]; then
-                    read -rp "Continue update without automated reapplication of '${ext}'? [y/N]: " choice
-                    if [[ ! "${choice}" =~ ^[Yy]$ ]]; then
-                        log_fatal "Update aborted by user due to missing extension package."
-                        exit "${EX_GENERAL}"
-                    fi
-                fi
+                log_fatal "Keep ${ext}.blueprint in the panel root before updating. No panel files have been replaced."
+                exit "${EX_NOINPUT}"
             fi
         done
     fi
@@ -1432,46 +1474,27 @@ cmd_update() {
     BACKUP="$(mktemp -d "${BACKUP_DIR}/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
     chmod 0700 "${BACKUP}"
 
-    artisan down --retry=60 >> "${LOG_FILE}" 2>&1 || true
+    artisan down --retry=60 >> "${LOG_FILE}" 2>&1
     MAINTENANCE_ENABLED=1
 
     if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet aquadactyl-blueprint-installer.service; then
+            systemctl stop aquadactyl-blueprint-installer.service >> "${LOG_FILE}" 2>&1
+            BLUEPRINT_WAS_RUNNING=1
+        fi
         if systemctl is-active --quiet "${AQUAQ_SERVICE}"; then
-            systemctl stop "${AQUAQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
+            systemctl stop "${AQUAQ_SERVICE}" >> "${LOG_FILE}" 2>&1
             AQUAQ_WAS_RUNNING=1
         fi
         if systemctl is-active --quiet "${PTEROQ_SERVICE}"; then
-            systemctl stop "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || true
+            systemctl stop "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1
             PTEROQ_WAS_RUNNING=1
         fi
     fi
 
-    local db_dump_ok=0
-    if run_silent "database backup" artisan p:maintenance:backup-database "${BACKUP}/database.sql"; then
-        db_dump_ok=1
-    fi
-
-    if [[ "${db_dump_ok}" -eq 0 ]]; then
-        local db_host db_port db_name db_user db_pass
-        db_host="$(grep -E '^DB_HOST=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" || echo "127.0.0.1")"
-        db_port="$(grep -E '^DB_PORT=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" || echo "3306")"
-        db_name="$(grep -E '^DB_DATABASE=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
-        db_user="$(grep -E '^DB_USERNAME=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
-        db_pass="$(grep -E '^DB_PASSWORD=' "${PANEL_ROOT}/.env" | cut -d'=' -f2- | tr -d '"'"'" || echo "")"
-
-        local dump_tool=""
-        if command -v mariadb-dump >/dev/null 2>&1; then
-            dump_tool="mariadb-dump"
-        elif command -v mysqldump >/dev/null 2>&1; then
-            dump_tool="mysqldump"
-        else
-            log_fatal "Neither mariadb-dump nor mysqldump is installed on this host."
-            exit "${EX_UNAVAILABLE}"
-        fi
-
-        run_silent "database sql dump" "${dump_tool}" --host="${db_host}" --port="${db_port}" --user="${db_user}" --password="${db_pass}" \
-            --single-transaction --quick --routines "${db_name}" > "${BACKUP}/database.sql"
-    fi
+    # The snapshot directory is root-only. Run this bounded maintenance command
+    # as the deployment owner rather than making secrets readable to the web user.
+    run_silent "database backup" php "${PANEL_ROOT}/artisan" p:maintenance:backup-database "${BACKUP}/database.sql"
 
     if [[ ! -s "${BACKUP}/database.sql" ]]; then
         log_fatal "Database dump failed or produced an empty backup."
@@ -1489,7 +1512,11 @@ cmd_update() {
 
     # Step 6: Sync Files & Dependencies
     show_progress "Synchronizing Release Files & Dependencies"
-    run_silent "rsync release files" rsync -a --no-owner --no-group \
+    run_silent "rsync release files" rsync -a --delete --no-owner --no-group \
+        --exclude='.git/' --exclude='.panel-deploy.lock' \
+        --exclude='vendor/' --exclude='node_modules/' --exclude='*.blueprint' \
+        --include='.blueprint/extensions/blueprint/' --exclude='.blueprint/extensions/*/' \
+        --exclude='public/extensions/' \
         --exclude='.env' \
         --exclude='.blueprintrc' \
         --exclude='storage/' \
@@ -1521,9 +1548,7 @@ cmd_update() {
 
             if [[ -n "${ext_path}" ]]; then
                 log_info "Reapplying Blueprint extension: ${ext}..."
-                run_silent "reapply extension ${ext}" bash "${PANEL_ROOT}/blueprint.sh" -bash -i "${ext_path}" || {
-                    log_warn "Failed to reapply extension '${ext}'. Continuing..."
-                }
+                run_silent "reapply extension ${ext}" bash "${PANEL_ROOT}/blueprint.sh" -bash -i "${ext_path}"
             fi
         done
     fi
@@ -1533,11 +1558,11 @@ cmd_update() {
     build_frontend
     finish_deployment
 
-    if [[ "${AQUAQ_WAS_RUNNING}" -eq 1 || "${PTEROQ_WAS_RUNNING}" -eq 1 ]]; then
-        systemctl start "${AQUAQ_SERVICE}" >> "${LOG_FILE}" 2>&1 || log_warn "Failed to start ${AQUAQ_SERVICE}."
-    fi
+    [[ "${AQUAQ_WAS_RUNNING}" -ne 1 ]] || systemctl start "${AQUAQ_SERVICE}" >> "${LOG_FILE}" 2>&1
+    [[ "${PTEROQ_WAS_RUNNING}" -ne 1 ]] || systemctl start "${PTEROQ_SERVICE}" >> "${LOG_FILE}" 2>&1
+    [[ "${BLUEPRINT_WAS_RUNNING}" -ne 1 ]] || systemctl start aquadactyl-blueprint-installer.service >> "${LOG_FILE}" 2>&1
 
-    artisan up >> "${LOG_FILE}" 2>&1 || true
+    artisan up >> "${LOG_FILE}" 2>&1
     MAINTENANCE_ENABLED=0
 
     echo ""
@@ -1728,8 +1753,8 @@ One-Liner Usage:
 
 Commands:
   install             Full panel automated install (dependencies, clone, .env, DB, Blueprint, build).
-  setup-host          Install system packages only (PHP 8.5, MariaDB, Node 22, pnpm 12.10.1, Composer).
-  update              Managed zero-downtime update from GitHub release tag or local archive.
+  setup-host          Install system packages (PHP 8.5, MariaDB, Node 24, pnpm 12.15.0, Composer).
+  update              Fetch a Git release tag, back up and update during maintenance.
   permissions         Restore strict least-privilege permissions across PANEL_ROOT.
   remove              Complete uninstallation & rollback (stops services, drops DB, deletes panel).
 
@@ -1752,6 +1777,7 @@ main() {
     # Immediately enforce root user privileges and UTF-8 environment
     if [[ "${1:-}" != "-h" && "${1:-}" != "--help" && "${1:-}" != "help" ]]; then
         enforce_root_and_utf8
+        initialize_log
     fi
 
     if [[ $# -eq 0 ]]; then
@@ -1797,4 +1823,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -1,0 +1,37 @@
+name: aquadactyl-installer-smoke
+services:
+  database:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: release-smoke-only
+      MARIADB_DATABASE: release_smoke
+    tmpfs: [/var/lib/mysql]
+    healthcheck:
+      test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+      interval: 2s
+      timeout: 5s
+      retries: 45
+  cache:
+    image: redis:7-alpine
+  panel:
+    build:
+      context: ${PANEL_SOURCE_DIR:-../../aquadactyl}
+      dockerfile: tests/runtime/Dockerfile
+    image: aquadactyl-installer-tests:php85
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_started
+    environment:
+      AQUADACTYL_INSTALLER_SMOKE: 1
+      COMPOSER_HOME: /composer
+    volumes:
+      - ${PANEL_SOURCE_DIR:-../../aquadactyl}:/panel-source:ro
+      - ..:/tools:ro
+      - ./panel-smoke.sh:/smoke.sh:ro
+      - ../build/installer-smoke:/reports
+      - composer-cache:/composer
+    entrypoint: [bash, /smoke.sh]
+volumes:
+  composer-cache:
