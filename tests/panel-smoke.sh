@@ -25,6 +25,8 @@ test -s public/build/manifest.json
 test -f .blueprint/extensions/blueprint/private/db/is_installed
 runuser -u www-data -- php artisan migrate:status
 before="$(sha256sum .env)"
+printf '\n# Retain operator configuration during updates\nPHP_FPM_SERVICE="php8.5-fpm"\n' >> .blueprintrc
+blueprint_before="$(sha256sum .blueprintrc)"
 printf 'persistent upload\n' > storage/release-marker
 printf 'obsolete core\n' > obsolete-release-file.php
 mkdir -p .blueprint/extensions/smoke/fs
@@ -43,6 +45,7 @@ git -C /source-release commit -qm release
 git -C /source-release tag v1.0-beta
 REPO_URL=/source-release bash /tools/deploy.sh update v1.0-beta
 test "$before" = "$(sha256sum .env)"
+test "$blueprint_before" = "$(sha256sum .blueprintrc)"
 test "$(cat storage/release-marker)" = 'persistent upload'
 test "$(cat .blueprint/extensions/smoke/fs/state)" = 'addon data'
 test ! -f obsolete-release-file.php

@@ -597,12 +597,15 @@ initialize_blueprint() {
     rm -f "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/is_installed" \
           "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/version"
 
-    # Generate .blueprintrc
-    cat > "${PANEL_ROOT}/.blueprintrc" <<EOF
+    # Generate defaults only for new installs. Updates retain custom CLI flags,
+    # PHP-FPM service names and extension lifecycle configuration.
+    if [[ ! -f "${PANEL_ROOT}/.blueprintrc" ]]; then
+        cat > "${PANEL_ROOT}/.blueprintrc" <<EOF
 WEBUSER="${WEB_USER}"
 OWNERSHIP="root:${WEB_GROUP}"
 USERSHELL="/bin/bash"
 EOF
+    fi
     chown "root:${WEB_GROUP}" "${PANEL_ROOT}/.blueprintrc"
     chmod 0640 "${PANEL_ROOT}/.blueprintrc"
 
