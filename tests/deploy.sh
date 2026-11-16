@@ -170,10 +170,17 @@ refresh_install_source v1.0-beta
 check_install_destination v1.0-beta 0
 mkdir -p "$PANEL_ROOT/vendor"
 if check_install_destination v1.0-beta 1 >/dev/null 2>&1; then echo 'Accepted initialized panel recovery' >&2; exit 1; fi
+check_install_destination v1.0-beta 0 1
+if check_install_destination v1.0-beta 1 1 >/dev/null 2>&1; then echo 'Accepted conflicting resume/replacement' >&2; exit 1; fi
+if check_install_destination v2.0-beta 0 1 >/dev/null 2>&1; then echo 'Accepted mismatched resume source' >&2; exit 1; fi
+mv "$PANEL_ROOT/.env" "$PANEL_ROOT/.env.saved"
+if check_install_destination v1.0-beta 0 1 >/dev/null 2>&1; then echo 'Accepted resume without existing configuration' >&2; exit 1; fi
+mv "$PANEL_ROOT/.env.saved" "$PANEL_ROOT/.env"
 rm -d "$PANEL_ROOT/vendor"
 mkdir -p "$PANEL_ROOT/.blueprint/extensions/blueprint/private/db"
 touch "$PANEL_ROOT/.blueprint/extensions/blueprint/private/db/is_installed"
 if check_install_destination v1.0-beta 1 >/dev/null 2>&1; then echo 'Accepted initialized Blueprint recovery' >&2; exit 1; fi
+if check_install_destination v1.0-beta 0 1 >/dev/null 2>&1; then echo 'Accepted initialized Blueprint resume' >&2; exit 1; fi
 rm "$PANEL_ROOT/.blueprint/extensions/blueprint/private/db/is_installed"
 printf 'an-existing-addon\n' > "$PANEL_ROOT/.blueprint/extensions/blueprint/private/db/installed_extensions"
 if check_install_destination v1.0-beta 1 >/dev/null 2>&1; then echo 'Accepted installed addon recovery' >&2; exit 1; fi

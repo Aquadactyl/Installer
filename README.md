@@ -11,7 +11,7 @@ working DNS, outbound HTTPS and enough disk space for a source build and backups
 The script configures system packages and services on that host.
 
 ```bash
-git clone --depth 1 --branch v1.0-beta.2 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+git clone --depth 1 --branch v1.0-beta.3 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
 cd /opt/aquadactyl-installer
 sudo bash deploy.sh install v1.0-beta
 ```
@@ -23,7 +23,7 @@ schema, initializes bundled Blueprint, builds assets and configures Nginx,
 `aquaq.service` and the minute scheduler. It prompts for panel/database settings
 and administrator creation. Existing initialized panels must use `update`.
 
-The installer revision (`v1.0-beta.2`) and panel release (`v1.0-beta`) are separate.
+The installer revision (`v1.0-beta.3`) and panel release (`v1.0-beta`) are separate.
 Git's detached-HEAD message is normal when selecting a release tag.
 
 Ubuntu 22.04 uses the same PHP PPA and verified Node.js 24 binaries as newer
@@ -43,8 +43,31 @@ manually selected older PHP CLI alternative is not automatically changed: use
 Select a supported CLI deliberately before retrying; existing FPM pools and
 other applications can have their own PHP requirements.
 
+### Database authentication and resuming installation
+
+If migrations report access denied, verify the saved endpoint, database account,
+host and password. `CREATE USER IF NOT EXISTS` preserves an existing account's
+password; it does not synchronize that password with a newly written `.env`.
+The installer does not reset existing database-account passwords automatically.
+Database connectivity is checked before generating keys or entering maintenance.
+
+After repairing the saved database configuration, resume a failed installation
+that already installed dependencies but has not initialized Blueprint:
+
+```bash
+sudo bash deploy.sh install v1.0-beta --resume
+```
+
+Resume requires the matching release source, an existing `.env` and `vendor/`.
+It reuses the saved configuration without repeating setup prompts, preserves
+existing application keys and uploads, reruns locked dependency installation and
+completes migrations, Blueprint, assets and services. It clears maintenance only
+after successful completion. Do not regenerate `APP_KEY` or drop the database to
+repair authentication. Initialized panels or addon state require `update`.
+`--resume` and `--refresh-source` cannot be combined.
+
 If an earlier installer rejected Ubuntu 22.04 after recovering the source,
-select `v1.0-beta.2` and rerun `install v1.0-beta` without `--refresh-source`.
+select `v1.0-beta.3` and rerun `install v1.0-beta` without `--refresh-source`.
 The source already matches the release and the earlier backup remains intact.
 
 ### APT repository errors
@@ -86,8 +109,8 @@ version (for example, `canary`), and it is an unused or unfinished installation:
 
 ```bash
 cd /opt/aquadactyl-installer
-git fetch origin tag v1.0-beta.2
-git checkout --detach v1.0-beta.2
+git fetch origin tag v1.0-beta.3
+git checkout --detach v1.0-beta.3
 sudo bash deploy.sh install v1.0-beta --refresh-source
 ```
 
@@ -194,3 +217,8 @@ docker compose -f tests/compose.yaml -f tests/compose.host.yaml down
 This test also uses simulated service-control calls after provisioning; it does
 not replace a systemd host test. `UBUNTU_VERSION` selects another supported Ubuntu
 release for the fixture. CI exercises Ubuntu 22.04 provisioning on every change.
+
+Add `-e AQUADACTYL_INSTALLER_LOCAL_DB=1` to the host test's `run` command to use
+Ubuntu's local MariaDB server and an existing non-root panel database account.
+This exercises the local account-provisioning path, mismatched saved credentials
+and resume after fixing them, in addition to the default separate-database test.

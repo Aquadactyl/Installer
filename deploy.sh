@@ -298,9 +298,19 @@ panel_source_version() {
 }
 
 check_install_destination() {
-    local tag="$1" refresh_source="$2" detected
-    if [[ -d "${PANEL_ROOT}/vendor" || -f "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/is_installed" || -s "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/installed_extensions" ]]; then
-        log_fatal "An initialized or dependency-installed panel exists at ${PANEL_ROOT}. Use deploy.sh update ${tag}; --refresh-source never replaces an initialized panel."
+    local tag="$1" refresh_source="$2" resume_install="${3:-0}" detected
+    if [[ -f "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/is_installed" || -s "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/installed_extensions" ]]; then
+        log_fatal "An initialized panel exists at ${PANEL_ROOT}. Use deploy.sh update ${tag}; installation recovery never replaces an initialized panel."
+        return "${EX_DATAERR}"
+    fi
+    if [[ "${resume_install}" == 1 ]]; then
+        if [[ "${refresh_source}" == 1 || ! -f "${PANEL_ROOT}/artisan" || ! -f "${PANEL_ROOT}/.env" || ! -d "${PANEL_ROOT}/vendor" ]]; then
+            log_fatal "--resume requires the matching unfinished checkout, its existing .env and installed dependencies; it cannot be combined with --refresh-source."
+            return "${EX_DATAERR}"
+        fi
+    elif [[ -d "${PANEL_ROOT}/vendor" ]]; then
+        log_fatal "Dependencies already exist at ${PANEL_ROOT}. For this unfinished installation only, repair its configuration and run: sudo bash deploy.sh install ${tag} --resume"
+        log_info "Use update for a working panel. --refresh-source never replaces dependency-installed source."
         return "${EX_DATAERR}"
     fi
     [[ -f "${PANEL_ROOT}/artisan" ]] || return 0
@@ -311,6 +321,30 @@ check_install_destination() {
         log_info "This fetches the release first, then privately backs up the old directory and preserves configuration and uploads. No panel files were changed."
         return "${EX_DATAERR}"
     fi
+}
+
+verify_database_connection() {
+    log_info "Checking the panel's configured database connection before migrations..."
+    if php <<'PHP'
+<?php
+try {
+    require 'vendor/autoload.php';
+    $app = require 'bootstrap/app.php';
+    $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+    $app->make('db')->connection()->select('SELECT 1');
+    fwrite(STDOUT, "[OK] Panel database connection verified.\n");
+} catch (Throwable $exception) {
+    // Do not print credentials, connection URLs or arbitrary bootstrap errors.
+    fwrite(STDERR, "[ERROR] The panel cannot connect using its saved database configuration.\n");
+    fwrite(STDERR, "Verify the database endpoint, account host, password and grants. Existing database-account passwords are never reset automatically.\n");
+    exit(69);
+}
+PHP
+    then
+        return 0
+    fi
+    log_info "Repair the saved configuration, then run: sudo bash deploy.sh install ${RELEASE_TAG} --resume"
+    return "${EX_UNAVAILABLE}"
 }
 
 refresh_install_source() {
@@ -1099,14 +1133,15 @@ cmd_install() {
     echo -e "${CLR_CYAN}${CLR_BOLD}=== Aquadactyl Panel Full Automated Installation ===${CLR_RESET}"
 
     enforce_root_and_utf8
-    local refresh_source=0 tag_seen=0
+    local refresh_source=0 resume_install=0 tag_seen=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --refresh-source) refresh_source=1 ;;
+            --resume) resume_install=1 ;;
             v*)
                 [[ "${tag_seen}" == 0 ]] || { log_fatal "Supply one release tag."; exit "${EX_USAGE}"; }
                 RELEASE_TAG="$1"; tag_seen=1 ;;
-            *) log_fatal "Usage: deploy.sh install [v1.0-beta] [--refresh-source]"; exit "${EX_USAGE}" ;;
+            *) log_fatal "Usage: deploy.sh install [v1.0-beta] [--refresh-source | --resume]"; exit "${EX_USAGE}" ;;
         esac
         shift
     done
@@ -1114,7 +1149,7 @@ cmd_install() {
     # Always reject unsupported hosts before package provisioning, moving an
     # unfinished checkout or changing its .env, even if runtimes already exist.
     validate_os
-    check_install_destination "${RELEASE_TAG}" "${refresh_source}"
+    check_install_destination "${RELEASE_TAG}" "${refresh_source}" "${resume_install}"
 
     TOTAL_STEPS=10
     CURRENT_STEP=0
@@ -1174,7 +1209,7 @@ cmd_install() {
     fi
 
     # Interactive configuration prompt (reads from /dev/tty so curl | bash can ask questions)
-    if [[ "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" ]]; then
+    if [[ "${resume_install}" != 1 && "${NON_INTERACTIVE}" != "1" && "${NON_INTERACTIVE}" != "true" ]]; then
         local tty_in=""
         if [[ -e /dev/tty ]]; then
             tty_in="/dev/tty"
@@ -1240,13 +1275,13 @@ cmd_install() {
     db_pass="$(grep -E '^DB_PASSWORD=' .env | cut -d'=' -f2- | tr -d '"'"'" | tr -d '\r' || echo "")"
 
     # Ensure DB_HOST is explicitly 127.0.0.1 (not localhost) to use TCP loopback port 3306
-    if [[ "${db_host}" == "localhost" || -z "${db_host}" ]]; then
+    if [[ "${resume_install}" != 1 && ( "${db_host}" == "localhost" || -z "${db_host}" ) ]]; then
         sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" .env
         db_host="127.0.0.1"
     fi
 
     # If DB password is empty or default, generate a secure random one
-    if [[ -z "${db_pass}" || "${db_pass}" == "your_secure_password" || "${db_pass}" == "secret" ]]; then
+    if [[ "${resume_install}" != 1 && ( -z "${db_pass}" || "${db_pass}" == "your_secure_password" || "${db_pass}" == "secret" ) ]]; then
         db_pass="$(head -c 16 /dev/urandom | sha256sum | head -c 24)"
         if grep -q "^DB_PASSWORD=" .env; then
             sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${db_pass}|" .env
@@ -1303,13 +1338,15 @@ cmd_install() {
         local sql_password
         sql_password="${db_pass//\\/\\\\}"
         sql_password="${sql_password//\'/\'\'}"
-        "${db_client}" -u root -e "
+        # Pass SQL over stdin so a database password never appears in process arguments.
+        "${db_client}" -u root >> "${LOG_FILE}" 2>&1 <<SQL
             CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
             CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${sql_password}';
             GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1';
-        " >> "${LOG_FILE}" 2>&1
+SQL
     fi
 
+    verify_database_connection
 
     # Step 6: Generate Encryption Keys and Salt
     show_progress "Generating Application Keys & Hashids Salt"
@@ -1907,6 +1944,11 @@ Unfinished Checkout Recovery:
   sudo bash deploy.sh install v1.0-beta --refresh-source
   Fetch the release before backing up unfinished source; preserve .env and uploads.
   Initialized panels are refused even with --refresh-source; use update instead.
+
+Resume a Failed Installation:
+  sudo bash deploy.sh install v1.0-beta --resume
+  Keep matching source, existing .env and keys after dependencies are installed.
+  Repair database credentials first. Initialized panels must use update.
 
 Update Usage:
   sudo bash deploy.sh update <release-tag> [owner/repository]

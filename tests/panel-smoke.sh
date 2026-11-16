@@ -11,6 +11,26 @@ cp /panel-source/.env.example "$PANEL_ROOT/.env"
 cd "$PANEL_ROOT"
 sed -i "s/    'version' => 'canary',/    'version' => '1.0-beta',/" config/app.php
 sed -i 's|^APP_URL=.*|APP_URL=http://localhost|;s|^DB_HOST=.*|DB_HOST=database|;s|^DB_DATABASE=.*|DB_DATABASE=release_smoke|;s|^DB_USERNAME=.*|DB_USERNAME=root|;s|^DB_PASSWORD=.*|DB_PASSWORD=release-smoke-only|;s|^REDIS_HOST=.*|REDIS_HOST=cache|;s|^SESSION_SECURE_COOKIE=.*|SESSION_SECURE_COOKIE=false|' .env
+
+# Exercise Ubuntu's local database provisioning and existing non-root account
+# semantics too, rather than testing only a separate database container as root.
+if [[ ${AQUADACTYL_INSTALLER_LOCAL_DB:-} == 1 ]]; then
+    install -d -o mysql -g mysql /run/mysqld
+    mariadbd --user=mysql --bind-address=127.0.0.1 > /reports/local-mariadb.log 2>&1 &
+    for attempt in $(seq 1 30); do
+        if mariadb-admin --protocol=socket ping --silent >/dev/null 2>&1; then break; fi
+        sleep 1
+    done
+    mariadb --protocol=socket -u root <<'SQL'
+CREATE DATABASE release_smoke;
+CREATE USER 'aquadactyl'@'127.0.0.1' IDENTIFIED BY 'release-smoke-only';
+CREATE USER 'aquadactyl'@'localhost' IDENTIFIED BY 'release-smoke-only';
+GRANT ALL PRIVILEGES ON release_smoke.* TO 'aquadactyl'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON release_smoke.* TO 'aquadactyl'@'localhost';
+SQL
+    sed -i 's|^DB_HOST=.*|DB_HOST=127.0.0.1|;s|^DB_USERNAME=.*|DB_USERNAME=aquadactyl|' .env
+fi
+
 cat > /usr/local/bin/systemctl <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> /reports/systemctl-calls.txt
@@ -44,9 +64,30 @@ git -C /source-release config user.email test@example.invalid
 git -C /source-release add .
 git -C /source-release commit -qm release
 git -C /source-release tag v1.0-beta
-REPO_URL=/source-release bash /tools/deploy.sh install v1.0-beta --refresh-source
+
+# A saved password from an earlier attempt can disagree with an existing DB
+# account. Fail before maintenance or key generation, then resume in place.
+sed -i 's|^DB_PASSWORD=.*|DB_PASSWORD=incorrect-saved-password|' .env
+if REPO_URL=/source-release bash /tools/deploy.sh install v1.0-beta --refresh-source > /reports/database-mismatch.log 2>&1; then
+    echo 'Install accepted invalid database credentials.' >&2; exit 1
+else
+    test "$?" = 69
+fi
 # Recovery moved the directory that was this shell's working directory too.
 cd "$PANEL_ROOT"
+grep -q 'cannot connect using its saved database configuration' /reports/database-mismatch.log
+grep -q -- '--resume' /reports/database-mismatch.log
+test ! -f storage/framework/down
+test ! -f .blueprint/extensions/blueprint/private/db/is_installed
+test -d vendor
+
+sed -i 's|^DB_PASSWORD=.*|DB_PASSWORD=release-smoke-only|' .env
+php artisan key:generate --force
+sed -i 's|^HASHIDS_SALT=.*|HASHIDS_SALT=preserve-resume-test-salt|' .env
+php artisan down --retry=60
+resume_env="$(sha256sum .env)"
+REPO_URL=/source-release bash /tools/deploy.sh install v1.0-beta --resume
+test "$resume_env" = "$(sha256sum .env)"
 test "$(cat storage/app/public/preinstall.txt)" = 'keep old uploaded data'
 find /var/backups/aquadactyl -path '*/panel/local-edits.txt' | grep .
 test -s public/build/manifest.json
@@ -78,4 +119,4 @@ for attempt in $(seq 1 30); do
   sleep 1
 done
 grep -q '<html' /reports/login.html
-printf 'Unfinished-checkout recovery, Git update, data preservation, backups and login HTTP checks passed.\n'
+printf 'Unfinished-checkout recovery, failed database authentication, resume, Git update, data preservation, backups and login HTTP checks passed.\n'
