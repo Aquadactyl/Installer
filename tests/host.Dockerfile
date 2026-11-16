@@ -15,6 +15,6 @@ RUN bash /tools/deploy.sh setup-host \
     && runuser -u www-data -- pnpm --version \
     && mariadb --version \
     && redis-server --version \
-    && bash /tools/tests/runtime-checks.sh \
+    && AQUADACTYL_RUNTIME_SMOKE=1 bash /tools/tests/runtime-checks.sh \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

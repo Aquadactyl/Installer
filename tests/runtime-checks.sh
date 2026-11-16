@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-[[ -f /.dockerenv && $EUID == 0 ]] || { echo 'Run in the disposable host test image.' >&2; exit 1; }
+[[ $EUID == 0 && ( -f /.dockerenv || ${AQUADACTYL_RUNTIME_SMOKE:-} == 1 ) ]] || { echo 'Run in the disposable host test image.' >&2; exit 1; }
 source "$(dirname "$0")/../deploy.sh"
 trap - EXIT HUP INT QUIT TERM
 fixture="$(mktemp -d)"
