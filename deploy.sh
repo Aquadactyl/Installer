@@ -390,23 +390,66 @@ validate_os() {
 }
 
 host_runtimes_ready() {
-    local bin node_version
+    local diagnose="${1:-0}" bin node_version web_node_version detected
     for bin in php composer node npm pnpm git curl tar zip unzip rsync flock runuser sha256sum grep sed awk mktemp; do
-        command -v "$bin" >/dev/null 2>&1 || return 1
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            runtime_failure "${diagnose}" "Missing required command: ${bin}."; return 1
+        fi
     done
-    php -r 'exit(PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600 ? 0 : 1);' 2>/dev/null || return 1
-    composer --version 2>/dev/null | grep -q '^Composer version 2\.' || return 1
-    node_version="$(node --version 2>/dev/null)" || return 1
-    semver_ge "${node_version#v}" 24.22.1 || return 1
-    [[ "$(pnpm --version 2>/dev/null)" == "${DEFAULT_PINNED_PNPM}" ]] || return 1
-    runuser -u "${WEB_USER}" -- node --version >/dev/null 2>&1 || return 1
-    [[ "$(runuser -u "${WEB_USER}" -- pnpm --version 2>/dev/null)" == "${DEFAULT_PINNED_PNPM}" ]]
+    if ! php -r 'exit(PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600 ? 0 : 1);' 2>/dev/null; then
+        detected="$(php -r 'echo PHP_VERSION;' 2>/dev/null || true)"
+        runtime_failure "${diagnose}" "PHP CLI at $(command -v php) reports '${detected:-unavailable}'; PHP 8.4.x or 8.5.x is required. Check any manually selected PHP alternative or executable overriding /usr/bin/php."; return 1
+    fi
+    detected="$(composer --no-ansi --version 2>/dev/null || true)"
+    if [[ ! "${detected}" =~ ^Composer[[:space:]]version[[:space:]]2\. ]]; then
+        runtime_failure "${diagnose}" "Composer at $(command -v composer) reports '${detected:-unavailable}'; Composer 2 is required."; return 1
+    fi
+    node_version="$(node --version 2>/dev/null || true)"
+    if [[ ! "${node_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! semver_ge "${node_version#v}" 24.22.1; then
+        runtime_failure "${diagnose}" "Node.js at $(command -v node) reports '${node_version:-unavailable}'; >= 24.22.1 is required."; return 1
+    fi
+    detected="$(cd / && pnpm --version 2>/dev/null || true)"
+    if [[ "${detected}" != "${DEFAULT_PINNED_PNPM}" ]]; then
+        runtime_failure "${diagnose}" "pnpm at $(command -v pnpm) reports '${detected:-unavailable}'; ${DEFAULT_PINNED_PNPM} is required."; return 1
+    fi
+    # Check in a public directory so an operator's private working directory or
+    # project packageManager setting cannot affect this runtime-only probe.
+    web_node_version="$(cd / && runuser -u "${WEB_USER}" -- node --version 2>/dev/null || true)"
+    if [[ ! "${web_node_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! semver_ge "${web_node_version#v}" 24.22.1; then
+        runtime_failure "${diagnose}" "Node.js for ${WEB_USER} reports '${web_node_version:-unavailable}'; >= 24.22.1 is required for that user too. Check system PATH and public runtime permissions."; return 1
+    fi
+    detected="$(cd / && runuser -u "${WEB_USER}" -- pnpm --version 2>/dev/null || true)"
+    if [[ "${detected}" != "${DEFAULT_PINNED_PNPM}" ]]; then
+        runtime_failure "${diagnose}" "pnpm for ${WEB_USER} reports '${detected:-unavailable}'; ${DEFAULT_PINNED_PNPM} is required. Check that pnpm and its Node executable are outside private home directories."; return 1
+    fi
+}
+
+runtime_failure() {
+    [[ "$1" != 1 ]] || log_err "$2"
+    return 0
+}
+
+prefer_system_tools() {
+    # Never load an operator's NVM shell code in a privileged installer. Queue
+    # and web processes need public binaries, independent of login-shell state.
+    local system_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    case "${PATH}" in
+        "${system_path}"|"${system_path}:"*) ;;
+        *) export PATH="${system_path}:${PATH}" ;;
+    esac
+    hash -r
 }
 
 install_pinned_pnpm() {
     # Public runtime files must be usable by the unprivileged web/queue user.
     # Keep the caller's restrictive umask for logs, backups and configuration.
-    (umask 022; npm install --global "pnpm@$1")
+    # An operator's .npmrc may set a private global prefix. Use a dedicated
+    # public prefix without changing their npm configuration or other packages.
+    (
+        umask 022
+        npm install --global --prefix /usr/local/lib/aquadactyl-tools "pnpm@$1" || exit "$?"
+        ln -sfn /usr/local/lib/aquadactyl-tools/bin/pnpm /usr/local/bin/pnpm
+    )
 }
 
 enforce_root_and_utf8() {
@@ -422,6 +465,7 @@ enforce_root_and_utf8() {
     export DEBIAN_FRONTEND="noninteractive"
     export NEEDRESTART_MODE="a"
 
+    prefer_system_tools
     validate_panel_root
 }
 
@@ -490,15 +534,6 @@ preflight() {
 
     enforce_root_and_utf8
     validate_os
-
-    # Source NVM environment if installed in root/home
-    if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
-        # shellcheck source=/dev/null
-        \. "${HOME}/.nvm/nvm.sh"
-    elif [[ -s "/root/.nvm/nvm.sh" ]]; then
-        # shellcheck source=/dev/null
-        \. "/root/.nvm/nvm.sh"
-    fi
 
     if ! command -v realpath >/dev/null 2>&1; then
         log_fatal "Required command 'realpath' is missing."
@@ -571,8 +606,10 @@ preflight() {
         log_fatal "Configured WEB_GROUP '${WEB_GROUP}' does not exist on the host system."
         exit "${EX_UNAVAILABLE}"
     fi
-    if ! runuser -u "${WEB_USER}" -- node --version >/dev/null 2>&1; then
-        log_fatal "Node.js must be executable by ${WEB_USER}; install it outside a private root/NVM home directory."
+    local web_node_version
+    web_node_version="$(cd / && runuser -u "${WEB_USER}" -- node --version 2>/dev/null || true)"
+    if [[ ! "${web_node_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! semver_ge "${web_node_version#v}" 24.22.1; then
+        log_fatal "Node.js for ${WEB_USER} reports '${web_node_version:-unavailable}'; >= 24.22.1 is required outside private root/NVM directories."
         exit "${EX_UNAVAILABLE}"
     fi
 
@@ -965,15 +1002,6 @@ cmd_setup_host() {
     enforce_root_and_utf8
     validate_os
 
-    # Source NVM environment if already installed
-    if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
-        # shellcheck source=/dev/null
-        \. "${HOME}/.nvm/nvm.sh"
-    elif [[ -s "/root/.nvm/nvm.sh" ]]; then
-        # shellcheck source=/dev/null
-        \. "/root/.nvm/nvm.sh"
-    fi
-
     export DEBIAN_FRONTEND=noninteractive
     ensure_apt_unlocked
 
@@ -1023,7 +1051,9 @@ cmd_setup_host() {
 
     local existing_node_ver="0.0.0"
     if command -v node >/dev/null 2>&1; then existing_node_ver="$(node -v | sed 's/^v//')"; fi
-    if ! semver_ge "${existing_node_ver}" "24.22.1" || ! runuser -u "${WEB_USER}" -- node --version >/dev/null 2>&1; then
+    local web_node_ver
+    web_node_ver="$(cd / && runuser -u "${WEB_USER}" -- node --version 2>/dev/null || true)"
+    if ! semver_ge "${existing_node_ver}" "24.22.1" || [[ ! "${web_node_ver}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! semver_ge "${web_node_ver#v}" "24.22.1"; then
         local node_arch node_file node_dir
         case "$(uname -m)" in
             x86_64) node_arch=x64 ;;
@@ -1048,20 +1078,14 @@ cmd_setup_host() {
     # Check if pnpm is already installed matching pinned version
     local current_pnpm=""
     if command -v pnpm >/dev/null 2>&1; then
-        current_pnpm="$(pnpm -v)"
+        current_pnpm="$(cd / && pnpm -v)"
     fi
 
-    if [[ "${current_pnpm}" == "${DEFAULT_PINNED_PNPM}" ]] && [[ "$(runuser -u "${WEB_USER}" -- pnpm --version 2>/dev/null)" == "${DEFAULT_PINNED_PNPM}" ]]; then
+    if [[ "${current_pnpm}" == "${DEFAULT_PINNED_PNPM}" ]] && [[ "$(cd / && runuser -u "${WEB_USER}" -- pnpm --version 2>/dev/null)" == "${DEFAULT_PINNED_PNPM}" ]]; then
         log_ok "pnpm@${current_pnpm} is already installed. Skipping pnpm installation."
     else
         log_info "Installing pinned pnpm@${DEFAULT_PINNED_PNPM}..."
         run_silent "install pnpm" install_pinned_pnpm "${DEFAULT_PINNED_PNPM}"
-        local pnpm_bin
-        pnpm_bin="$(npm prefix --global)/bin/pnpm"
-        [[ -x "${pnpm_bin}" ]] || { log_fatal "pnpm was not installed in the global npm prefix."; exit "${EX_UNAVAILABLE}"; }
-        if [[ "${pnpm_bin}" != /usr/local/bin/pnpm ]]; then
-            ln -sfn "${pnpm_bin}" /usr/local/bin/pnpm
-        fi
         hash -r
     fi
 
@@ -1103,7 +1127,7 @@ cmd_install() {
         show_progress "Checking Host Prerequisites"
         log_ok "Required host tools and runtime versions verified."
     fi
-    if ! host_runtimes_ready; then
+    if ! host_runtimes_ready 1; then
         log_fatal "Required runtimes are still unavailable after host setup. Check PHP CLI, Composer 2, Node.js >= 24.22.1 and pnpm ${DEFAULT_PINNED_PNPM}."
         exit "${EX_UNAVAILABLE}"
     fi

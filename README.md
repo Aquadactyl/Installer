@@ -32,6 +32,16 @@ checked before changing panel source or configuration. The installer never
 upgrades your operating system. Use systemd-enabled WSL if testing there.
 Existing commands are checked for supported versions and availability to the
 web user; outdated or private runtimes trigger host provisioning too.
+The installer prefers system binaries and does not load root's NVM shell
+configuration. Its pnpm installation uses `/usr/local/lib/aquadactyl-tools`,
+independent of any private npm global prefix configured for the operator.
+
+If runtime checks still fail after packages are installed, the diagnostic names
+the failing command, its selected path/version or the affected web user. A
+manually selected older PHP CLI alternative is not automatically changed: use
+`php -v`, `command -v php` and `update-alternatives --display php` to inspect it.
+Select a supported CLI deliberately before retrying; existing FPM pools and
+other applications can have their own PHP requirements.
 
 If an earlier installer rejected Ubuntu 22.04 after recovering the source,
 select `v1.0-beta.2` and rerun `install v1.0-beta` without `--refresh-source`.
