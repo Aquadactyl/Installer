@@ -1,0 +1,10 @@
+# Layer onto compose.yaml to exercise real Ubuntu provisioning and the panel.
+# No host ports, Docker socket, privileged container or persistent database.
+services:
+  panel:
+    build:
+      context: ..
+      dockerfile: tests/host.Dockerfile
+      args:
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-22.04}
+    image: aquadactyl-installer-host-tests:${UBUNTU_VERSION:-22.04}

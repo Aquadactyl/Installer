@@ -355,6 +355,16 @@ refresh_install_source() {
     chmod 0750 "${PANEL_ROOT}"
 }
 
+is_supported_os() {
+    # Explicit releases only: an interim Ubuntu release is not an LTS release.
+    local version="$2"
+    [[ "$1" != debian ]] || version="${version%%.*}"
+    case "$1:${version}" in
+        debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 validate_os() {
     log_info "Verifying host operating system..."
     if [[ ! -f /etc/os-release ]]; then
@@ -367,37 +377,36 @@ validate_os() {
     os_id="$(. /etc/os-release && echo "${ID:-}")"
     os_version_id="$(. /etc/os-release && echo "${VERSION_ID:-}")"
 
-    local is_supported=0
-
-    case "${os_id}" in
-        debian)
-            # Supported: Debian 12 (Bookworm), Debian 13 (Trixie)
-            local debian_major="${os_version_id%%.*}"
-            if [[ "${debian_major}" == "12" || "${debian_major}" == "13" ]]; then
-                is_supported=1
-            fi
-            ;;
-        ubuntu)
-            # Only supported LTS releases, never an EOL interim release.
-            if [[ "${os_version_id}" == "24.04" || "${os_version_id}" == "26.04" ]]; then
-                is_supported=1
-            fi
-            ;;
-        *)
-            is_supported=0
-            ;;
-    esac
-
-    if [[ "${is_supported}" -eq 0 ]]; then
+    if ! is_supported_os "${os_id}" "${os_version_id}"; then
         log_fatal "Unsupported operating system: ${os_id} ${os_version_id}."
         echo "Supported systems are:" >&2
         echo "  - Debian 12 (Bookworm) or Debian 13 (Trixie)" >&2
-        echo "  - Ubuntu 24.04+ LTS or Ubuntu 26.04+ LTS" >&2
-        echo "Older releases (Debian <= 11, Ubuntu <= 22) are unsupported." >&2
+        echo "  - Ubuntu 22.04, 24.04 or 26.04 LTS" >&2
+        echo "Use a supported host; this installer never upgrades the operating system." >&2
         exit "${EX_UNAVAILABLE}"
     fi
 
     log_ok "Operating system supported: ${os_id} ${os_version_id}"
+}
+
+host_runtimes_ready() {
+    local bin node_version
+    for bin in php composer node npm pnpm git curl tar zip unzip rsync flock runuser sha256sum grep sed awk mktemp; do
+        command -v "$bin" >/dev/null 2>&1 || return 1
+    done
+    php -r 'exit(PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600 ? 0 : 1);' 2>/dev/null || return 1
+    composer --version 2>/dev/null | grep -q '^Composer version 2\.' || return 1
+    node_version="$(node --version 2>/dev/null)" || return 1
+    semver_ge "${node_version#v}" 24.22.1 || return 1
+    [[ "$(pnpm --version 2>/dev/null)" == "${DEFAULT_PINNED_PNPM}" ]] || return 1
+    runuser -u "${WEB_USER}" -- node --version >/dev/null 2>&1 || return 1
+    [[ "$(runuser -u "${WEB_USER}" -- pnpm --version 2>/dev/null)" == "${DEFAULT_PINNED_PNPM}" ]]
+}
+
+install_pinned_pnpm() {
+    # Public runtime files must be usable by the unprivileged web/queue user.
+    # Keep the caller's restrictive umask for logs, backups and configuration.
+    (umask 022; npm install --global "pnpm@$1")
 }
 
 enforce_root_and_utf8() {
@@ -527,7 +536,7 @@ preflight() {
         current_pnpm="$(pnpm -v 2>/dev/null || echo "")"
         if [[ -n "${current_pnpm}" && "${current_pnpm}" != "${pinned_pnpm}" ]]; then
             log_warn "Installed pnpm (${current_pnpm}) does not match pinned version (${pinned_pnpm}). Re-installing pinned pnpm..."
-            npm install --global "pnpm@${pinned_pnpm}"
+            install_pinned_pnpm "${pinned_pnpm}"
         fi
     fi
 
@@ -974,7 +983,7 @@ cmd_setup_host() {
     fi
 
     # Install Composer 2 if not already present
-    if ! command -v composer >/dev/null 2>&1; then
+    if ! command -v composer >/dev/null 2>&1 || ! composer --version 2>/dev/null | grep -q '^Composer version 2\.'; then
         log_info "Installing Composer 2..."
         local composer_checksum
         composer_checksum="$(curl -fSsL https://composer.github.io/installer.sig)"
@@ -991,7 +1000,7 @@ cmd_setup_host() {
 
     local existing_node_ver="0.0.0"
     if command -v node >/dev/null 2>&1; then existing_node_ver="$(node -v | sed 's/^v//')"; fi
-    if ! semver_ge "${existing_node_ver}" "24.22.1"; then
+    if ! semver_ge "${existing_node_ver}" "24.22.1" || ! runuser -u "${WEB_USER}" -- node --version >/dev/null 2>&1; then
         local node_arch node_file node_dir
         case "$(uname -m)" in
             x86_64) node_arch=x64 ;;
@@ -1005,7 +1014,8 @@ cmd_setup_host() {
         curl -fSsL "https://nodejs.org/dist/latest-v24.x/${node_file}" -o "${WORK}/${node_file}"
         (cd "${WORK}" && grep -F "  ${node_file}" node-shasums | sha256sum --check --status)
         node_dir="/usr/local/lib/nodejs/${node_file%.tar.xz}"
-        mkdir -p "${node_dir}"
+        # initialize_log sets umask 077; runtime directories must remain public.
+        install -d -m 0755 /usr/local/lib/nodejs "${node_dir}"
         tar -xJf "${WORK}/${node_file}" --strip-components=1 -C "${node_dir}"
         for tool in node npm npx; do ln -sfn "${node_dir}/bin/${tool}" "/usr/local/bin/${tool}"; done
         export PATH="/usr/local/bin:${PATH}"
@@ -1018,16 +1028,18 @@ cmd_setup_host() {
         current_pnpm="$(pnpm -v)"
     fi
 
-    if [[ "${current_pnpm}" == "${DEFAULT_PINNED_PNPM}" ]]; then
+    if [[ "${current_pnpm}" == "${DEFAULT_PINNED_PNPM}" ]] && [[ "$(runuser -u "${WEB_USER}" -- pnpm --version 2>/dev/null)" == "${DEFAULT_PINNED_PNPM}" ]]; then
         log_ok "pnpm@${current_pnpm} is already installed. Skipping pnpm installation."
     else
         log_info "Installing pinned pnpm@${DEFAULT_PINNED_PNPM}..."
-        run_silent "install pnpm" npm install --global "pnpm@${DEFAULT_PINNED_PNPM}"
-        local node_bin_loc
-        node_bin_loc="$(dirname "$(command -v node 2>/dev/null || echo '/usr/local/bin/node')")"
-        if [[ -f "${node_bin_loc}/pnpm" ]]; then
-            ln -sf "${node_bin_loc}/pnpm" /usr/local/bin/pnpm
+        run_silent "install pnpm" install_pinned_pnpm "${DEFAULT_PINNED_PNPM}"
+        local pnpm_bin
+        pnpm_bin="$(npm prefix --global)/bin/pnpm"
+        [[ -x "${pnpm_bin}" ]] || { log_fatal "pnpm was not installed in the global npm prefix."; exit "${EX_UNAVAILABLE}"; }
+        if [[ "${pnpm_bin}" != /usr/local/bin/pnpm ]]; then
+            ln -sfn "${pnpm_bin}" /usr/local/bin/pnpm
         fi
+        hash -r
     fi
 
     log_ok "Host packages installed successfully."
@@ -1052,18 +1064,25 @@ cmd_install() {
         shift
     done
     validate_release_tag "${RELEASE_TAG}"
+    # Always reject unsupported hosts before package provisioning, moving an
+    # unfinished checkout or changing its .env, even if runtimes already exist.
+    validate_os
     check_install_destination "${RELEASE_TAG}" "${refresh_source}"
 
     TOTAL_STEPS=10
     CURRENT_STEP=0
 
     # Step 1: System Prerequisites
-    if ! command -v php >/dev/null 2>&1 || ! command -v composer >/dev/null 2>&1 || ! command -v pnpm >/dev/null 2>&1; then
+    if ! host_runtimes_ready; then
         show_progress "Installing Host Prerequisites & Build Tools"
         cmd_setup_host
     else
         show_progress "Checking Host Prerequisites"
-        log_ok "Host tools and runtimes verified."
+        log_ok "Required host tools and runtime versions verified."
+    fi
+    if ! host_runtimes_ready; then
+        log_fatal "Required runtimes are still unavailable after host setup. Check PHP CLI, Composer 2, Node.js >= 24.22.1 and pnpm ${DEFAULT_PINNED_PNPM}."
+        exit "${EX_UNAVAILABLE}"
     fi
 
     # Step 2: Clone panel repository

@@ -6,12 +6,12 @@ addons in staging before opening it to users.
 
 ## Install
 
-Use a dedicated Ubuntu 24.04/26.04 LTS or Debian 12/13 host. You need root,
+Use a dedicated Ubuntu 22.04/24.04/26.04 LTS or Debian 12/13 host. You need root,
 working DNS, outbound HTTPS and enough disk space for a source build and backups.
 The script configures system packages and services on that host.
 
 ```bash
-git clone --depth 1 --branch v1.0-beta.1 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+git clone --depth 1 --branch v1.0-beta.2 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
 cd /opt/aquadactyl-installer
 sudo bash deploy.sh install v1.0-beta
 ```
@@ -23,8 +23,19 @@ schema, initializes bundled Blueprint, builds assets and configures Nginx,
 `aquaq.service` and the minute scheduler. It prompts for panel/database settings
 and administrator creation. Existing initialized panels must use `update`.
 
-The installer revision (`v1.0-beta.1`) and panel release (`v1.0-beta`) are separate.
+The installer revision (`v1.0-beta.2`) and panel release (`v1.0-beta`) are separate.
 Git's detached-HEAD message is normal when selecting a release tag.
+
+Ubuntu 22.04 uses the same PHP PPA and verified Node.js 24 binaries as newer
+Ubuntu hosts; the PHP 8.4/8.5 requirement is unchanged. Host compatibility is
+checked before changing panel source or configuration. The installer never
+upgrades your operating system. Use systemd-enabled WSL if testing there.
+Existing commands are checked for supported versions and availability to the
+web user; outdated or private runtimes trigger host provisioning too.
+
+If an earlier installer rejected Ubuntu 22.04 after recovering the source,
+select `v1.0-beta.2` and rerun `install v1.0-beta` without `--refresh-source`.
+The source already matches the release and the earlier backup remains intact.
 
 ### Recover an unfinished checkout
 
@@ -33,8 +44,8 @@ version (for example, `canary`), and it is an unused or unfinished installation:
 
 ```bash
 cd /opt/aquadactyl-installer
-git fetch origin tag v1.0-beta.1
-git checkout --detach v1.0-beta.1
+git fetch origin tag v1.0-beta.2
+git checkout --detach v1.0-beta.2
 sudo bash deploy.sh install v1.0-beta --refresh-source
 ```
 
@@ -129,3 +140,15 @@ This stack publishes no ports and mounts no Docker socket. It verifies keys,
 uploads, addon data, SQL backups, obsolete-file removal and the login HTTP page.
 Systemd/FPM calls are stubbed in this test image; validate actual host services
 and trusted HTTPS on a disposable Linux host too. Reports stay in ignored `build/`.
+
+To test real Ubuntu 22.04 package provisioning, FPM/Nginx configuration checks
+and the same application installation/update flow:
+
+```bash
+docker compose -f tests/compose.yaml -f tests/compose.host.yaml run --build --rm panel
+docker compose -f tests/compose.yaml -f tests/compose.host.yaml down
+```
+
+This test also uses simulated service-control calls after provisioning; it does
+not replace a systemd host test. `UBUNTU_VERSION` selects another supported Ubuntu
+release for the fixture. CI exercises Ubuntu 22.04 provisioning on every change.
