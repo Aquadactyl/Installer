@@ -63,13 +63,17 @@ grep -q 'unsupported-host-check' "$test_root/unsupported-os.log"
     composer() { echo 'Composer version 2.9.0'; }
     node() { echo v24.22.1; }
     pnpm() { echo "$DEFAULT_PINNED_PNPM"; }
-    runuser() { [[ "${*: -2}" == 'pnpm --version' ]] && echo "$DEFAULT_PINNED_PNPM" || return 0; }
+    runuser() { case "${*: -2}" in 'pnpm --version') echo "$DEFAULT_PINNED_PNPM" ;; 'node --version') echo v24.22.1 ;; esac; }
     host_runtimes_ready
     runuser() { return 1; }
     if host_runtimes_ready; then echo 'Accepted a private runtime' >&2; exit 1; fi
-    runuser() { [[ "${*: -2}" == 'pnpm --version' ]] && echo "$DEFAULT_PINNED_PNPM" || return 0; }
+    runuser() { case "${*: -2}" in 'pnpm --version') echo "$DEFAULT_PINNED_PNPM" ;; 'node --version') echo v22.0.0 ;; esac; }
+    if host_runtimes_ready 1 > "$test_root/old-web-node.log" 2>&1; then echo 'Accepted old web-user Node' >&2; exit 1; fi
+    grep -q 'Node.js for .*v22.0.0' "$test_root/old-web-node.log"
+    runuser() { case "${*: -2}" in 'pnpm --version') echo "$DEFAULT_PINNED_PNPM" ;; 'node --version') echo v24.22.1 ;; esac; }
     php() { return 1; }
-    if host_runtimes_ready; then echo 'Accepted old PHP' >&2; exit 1; fi
+    if host_runtimes_ready 1 > "$test_root/old-php.log" 2>&1; then echo 'Accepted old PHP' >&2; exit 1; fi
+    grep -q 'PHP CLI at' "$test_root/old-php.log"
     php() { return 0; }
     node() { echo v22.0.0; }
     if host_runtimes_ready; then echo 'Accepted old Node' >&2; exit 1; fi
@@ -82,8 +86,22 @@ grep -q 'unsupported-host-check' "$test_root/unsupported-os.log"
 )
 
 (
+    mkdir -p "$test_root/private-bin"
+    printf '#!/bin/sh\nprintf "private-node\\n"\n' > "$test_root/private-bin/node"
+    chmod 0755 "$test_root/private-bin/node"
+    export PATH="$test_root/private-bin:$PATH"
+    [[ "$(command -v node)" == "$test_root/private-bin/node" ]]
+    prefer_system_tools
+    [[ "$(command -v node)" != "$test_root/private-bin/node" ]]
+    preferred_path="$PATH"
+    prefer_system_tools
+    [[ "$PATH" == "$preferred_path" ]]
+)
+
+(
     umask 077
-    npm() { [[ "$(umask)" == 0022 ]]; }
+    npm() { [[ "$(umask)" == 0022 && "$*" == "install --global --prefix /usr/local/lib/aquadactyl-tools pnpm@$DEFAULT_PINNED_PNPM" ]]; }
+    ln() { [[ "$*" == '-sfn /usr/local/lib/aquadactyl-tools/bin/pnpm /usr/local/bin/pnpm' ]]; }
     install_pinned_pnpm "$DEFAULT_PINNED_PNPM"
     [[ "$(umask)" == 0077 ]]
 )

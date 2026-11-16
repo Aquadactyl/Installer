@@ -8,7 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: bash -n deploy.sh && bash tests/deploy.sh
-      - run: shellcheck --severity=error deploy.sh tests/deploy.sh tests/panel-smoke.sh
+      - run: shellcheck --severity=error deploy.sh tests/deploy.sh tests/panel-smoke.sh tests/runtime-checks.sh
   ubuntu-host:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
