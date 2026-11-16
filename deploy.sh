@@ -433,6 +433,29 @@ ensure_apt_unlocked() {
     printf 'DPkg::Lock::Timeout "300";\n' > "${APT_CONFIG}"
 }
 
+refresh_apt_indexes() {
+    local description="${1:-apt-get update}" exit_code
+    # APT otherwise reports some signature/network failures as warnings and may
+    # continue with old indexes. Require every configured repository to refresh.
+    if run_silent "${description}" apt-get -o APT::Update::Error-Mode=any update; then
+        return 0
+    else
+        exit_code=$?
+    fi
+    log_err "APT could not refresh all configured host repositories. Package provisioning has stopped."
+    log_info "Repair the failing repository URLs or signing keys, then verify 'sudo apt-get -o APT::Update::Error-Mode=any update' succeeds before retrying."
+    log_info "Repository definitions are in /etc/apt/sources.list and /etc/apt/sources.list.d/*.list or *.sources."
+    log_info "Repository definitions and signing keys have not been changed by this failed refresh."
+    log_info "Do not use trusted=yes, --allow-unauthenticated or insecure-repository options to bypass these errors."
+    if [[ -f "${LOG_FILE}" ]] && grep -q 'downloads\.plex\.tv/repo/deb' "${LOG_FILE}"; then
+        log_info "The legacy Plex repository has moved. Follow https://support.plex.tv/articles/235974187-enable-repository-updating-for-supported-linux-server-distributions/"
+    fi
+    if [[ -f "${LOG_FILE}" ]] && grep -q 'NO_PUBKEY\|EXPKEYSIG\|BADSIG' "${LOG_FILE}"; then
+        log_info "APT reported a signing-key problem. Obtain the current key from that repository's vendor and retain signature verification."
+    fi
+    return "${exit_code}"
+}
+
 detect_php_fpm() {
     if [[ -n "${PHP_FPM_SERVICE}" ]]; then
         return 0
@@ -955,7 +978,7 @@ cmd_setup_host() {
     ensure_apt_unlocked
 
     log_info "Updating system packages and installing prerequisites..."
-    run_silent "apt-get update" apt-get update
+    refresh_apt_indexes || return "$?"
     run_silent "apt-get install base packages" apt-get install -y lsb-release ca-certificates curl apt-transport-https gnupg
 
     local os_id
@@ -968,7 +991,7 @@ cmd_setup_host() {
         run_silent "install sury keyring" dpkg -i "${WORK}/keyring.deb"
         printf 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ %s main\n' "$(lsb_release -sc)" > /etc/apt/sources.list.d/php.list
     fi
-    run_silent "apt-get update (sury)" apt-get update
+    refresh_apt_indexes "apt-get update (PHP repository)" || return "$?"
 
     log_info "Installing PHP ${PHP_VERSION}, MariaDB, Nginx, Redis, zip, and system tools..."
     run_silent "apt-get install server stack" apt-get install -y \

@@ -5,6 +5,32 @@ trap - EXIT HUP INT QUIT TERM
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
 
+# A failed host repository refresh must preserve its exit code, diagnose the
+# actual error, and request strict APT handling rather than accept stale indexes.
+(
+    initialize_log "$test_root"
+    before_log_permissions="$(stat -c %a "$LOG_FILE")"
+    apt-get() {
+        printf '%s\n' "$@" > "$test_root/apt-arguments"
+        printf '%s\n' 'E: https://downloads.plex.tv/repo/deb public Release: 404 Not Found' \
+            'W: GPG error: https://dlm.mariadb.com/repo/maxscale/latest/apt jammy InRelease: NO_PUBKEY 5D87FACA8C27D14E'
+        return 100
+    }
+    if refresh_apt_indexes > "$test_root/apt-failure.log" 2>&1; then
+        echo 'Accepted failed APT refresh' >&2; exit 1
+    else
+        [[ "$?" == 100 ]]
+    fi
+    grep -Fxq 'APT::Update::Error-Mode=any' "$test_root/apt-arguments"
+    grep -q 'Package provisioning has stopped' "$test_root/apt-failure.log"
+    grep -q 'legacy Plex repository has moved' "$test_root/apt-failure.log"
+    grep -q 'signing-key problem' "$test_root/apt-failure.log"
+    [[ "$(stat -c %a "$LOG_FILE")" == "$before_log_permissions" && "$before_log_permissions" == 600 ]]
+    apt-get() { return 0; }
+    refresh_apt_indexes > "$test_root/apt-success.log" 2>&1
+    ! grep -q 'could not refresh' "$test_root/apt-success.log"
+)
+
 for release in debian:12 debian:12.12 debian:13 ubuntu:22.04 ubuntu:24.04 ubuntu:26.04; do
     is_supported_os "${release%%:*}" "${release#*:}"
 done
