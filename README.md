@@ -11,7 +11,7 @@ working DNS, outbound HTTPS and enough disk space for a source build and backups
 The script configures system packages and services on that host.
 
 ```bash
-git clone --depth 1 --branch v1.0-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+git clone --depth 1 --branch v1.0-beta.1 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
 cd /opt/aquadactyl-installer
 sudo bash deploy.sh install v1.0-beta
 ```
@@ -22,6 +22,29 @@ installs locked packages, generates missing application secrets, migrates the
 schema, initializes bundled Blueprint, builds assets and configures Nginx,
 `aquaq.service` and the minute scheduler. It prompts for panel/database settings
 and administrator creation. Existing initialized panels must use `update`.
+
+The installer revision (`v1.0-beta.1`) and panel release (`v1.0-beta`) are separate.
+Git's detached-HEAD message is normal when selecting a release tag.
+
+### Recover an unfinished checkout
+
+If installation reports that an existing source directory has a different
+version (for example, `canary`), and it is an unused or unfinished installation:
+
+```bash
+cd /opt/aquadactyl-installer
+git fetch origin tag v1.0-beta.1
+git checkout --detach v1.0-beta.1
+sudo bash deploy.sh install v1.0-beta --refresh-source
+```
+
+Recovery fetches and validates the release first, then moves the complete old
+checkout into a private `preinstall-*` backup under `/var/backups/aquadactyl`.
+It retains `.env`, application keys, `.blueprintrc` and `storage/app` uploads in
+the new checkout. It never drops databases. Initialized panels or installed-addon
+records are refused: use the managed update/recovery flow for those installations.
+Without `--refresh-source`, mismatched source is left unchanged and the installer
+prints its detected version and the recovery command before provisioning packages.
 
 Use a real HTTPS `APP_URL`. Obtain a trusted TLS certificate before going live;
 the initial self-signed certificate is only for bootstrapping. Set email delivery,

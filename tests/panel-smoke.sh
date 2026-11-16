@@ -20,17 +20,18 @@ EOF
 chmod 0755 /usr/local/bin/systemctl
 # This disposable image supplies runtimes but has no systemd/FPM. Only service
 # control is stubbed; real database, Redis, migrations, Blueprint and builds run.
-bash /tools/deploy.sh install v1.0-beta
-test -s public/build/manifest.json
-test -f .blueprint/extensions/blueprint/private/db/is_installed
-runuser -u www-data -- php artisan migrate:status
-before="$(sha256sum .env)"
-printf '\n# Retain operator configuration during updates\nPHP_FPM_SERVICE="php8.5-fpm"\n' >> .blueprintrc
-blueprint_before="$(sha256sum .blueprintrc)"
-printf 'persistent upload\n' > storage/release-marker
-printf 'obsolete core\n' > obsolete-release-file.php
-mkdir -p .blueprint/extensions/smoke/fs
-printf 'addon data\n' > .blueprint/extensions/smoke/fs/state
+# Model the reported error: an old, unused canary checkout is already present.
+sed -i "s/    'version' => '1.0-beta',/    'version' => 'canary',/" config/app.php
+mkdir -p storage/app/public
+printf 'keep old uploaded data\n' > storage/app/public/preinstall.txt
+printf 'keep old source edits\n' > local-edits.txt
+if bash /tools/deploy.sh install v1.0-beta > /reports/source-mismatch.log 2>&1; then
+    echo 'Install accepted an unrequested source version.' >&2
+    exit 1
+fi
+grep -q -- '--refresh-source' /reports/source-mismatch.log
+test ! -d vendor
+test ! -d /var/backups/aquadactyl
 mkdir -p /source-release
 rsync -a --exclude=.git --exclude=node_modules --exclude=vendor --exclude='.env*' \
   --exclude=storage --exclude=bootstrap/cache --exclude=public/build --exclude=public/hot \
@@ -43,6 +44,21 @@ git -C /source-release config user.email test@example.invalid
 git -C /source-release add .
 git -C /source-release commit -qm release
 git -C /source-release tag v1.0-beta
+REPO_URL=/source-release bash /tools/deploy.sh install v1.0-beta --refresh-source
+# Recovery moved the directory that was this shell's working directory too.
+cd "$PANEL_ROOT"
+test "$(cat storage/app/public/preinstall.txt)" = 'keep old uploaded data'
+find /var/backups/aquadactyl -path '*/panel/local-edits.txt' | grep .
+test -s public/build/manifest.json
+test -f .blueprint/extensions/blueprint/private/db/is_installed
+runuser -u www-data -- php artisan migrate:status
+before="$(sha256sum .env)"
+printf '\n# Retain operator configuration during updates\nPHP_FPM_SERVICE="php8.5-fpm"\n' >> .blueprintrc
+blueprint_before="$(sha256sum .blueprintrc)"
+printf 'persistent upload\n' > storage/release-marker
+printf 'obsolete core\n' > obsolete-release-file.php
+mkdir -p .blueprint/extensions/smoke/fs
+printf 'addon data\n' > .blueprint/extensions/smoke/fs/state
 REPO_URL=/source-release bash /tools/deploy.sh update v1.0-beta
 test "$before" = "$(sha256sum .env)"
 test "$blueprint_before" = "$(sha256sum .blueprintrc)"
@@ -62,4 +78,4 @@ for attempt in $(seq 1 30); do
   sleep 1
 done
 grep -q '<html' /reports/login.html
-printf 'Fresh install, Git update, data preservation, backups and login HTTP checks passed.\n'
+printf 'Unfinished-checkout recovery, Git update, data preservation, backups and login HTTP checks passed.\n'

@@ -196,6 +196,9 @@ cleanup_and_handle_failure() {
     if [[ "${exit_code}" -ne 0 ]]; then
         echo ""
         log_fatal "Execution failed at line ${line_no} with exit code ${exit_code}."
+        if [[ -n "${BACKUP:-}" && -d "${BACKUP}/panel" ]]; then
+            log_info "Original unfinished checkout remains at ${BACKUP}/panel. Configuration and uploads are retained there."
+        fi
         if [[ "${MAINTENANCE_ENABLED}" -eq 1 ]]; then
             echo "================================================================================"
             echo "  APPLICATION MAINTENANCE MODE HAS BEEN LEFT ACTIVE FOR SAFETY."
@@ -210,8 +213,8 @@ cleanup_and_handle_failure() {
                 echo "    cat \"${PANEL_ROOT}/storage/logs/laravel-\$(date +%F).log\""
                 echo ""
                 echo "  To restore backup manually:"
-                echo "    mariadb -u aquadactyl -p aquadactyl < \"${BACKUP}/database.sql\""
-                echo "    tar -xzf \"${BACKUP}/panel.tar.gz\" -C \"${PANEL_ROOT}\""
+                [[ ! -f "${BACKUP}/database.sql" ]] || echo "    mariadb -u aquadactyl -p aquadactyl < \"${BACKUP}/database.sql\""
+                [[ ! -f "${BACKUP}/panel.tar.gz" ]] || echo "    tar -xzf \"${BACKUP}/panel.tar.gz\" -C \"${PANEL_ROOT}\""
             fi
             echo "================================================================================"
         fi
@@ -286,6 +289,70 @@ fetch_git_release() {
     git -C "${destination}/source.git" fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
     git -C "${destination}/source.git" archive --format=tar.gz "refs/tags/${tag}" > "${destination}/panel.tar.gz"
     git -C "${destination}/source.git" rev-parse "refs/tags/${tag}^{commit}" > "${destination}/source-commit"
+}
+
+panel_source_version() {
+    [[ -f "$1/config/app.php" ]] || return 0
+    # Read the version as data; never execute an existing checkout's PHP.
+    sed -nE "s/^[[:space:]]*['\"]version['\"][[:space:]]*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\\1/p" "$1/config/app.php"
+}
+
+check_install_destination() {
+    local tag="$1" refresh_source="$2" detected
+    if [[ -d "${PANEL_ROOT}/vendor" || -f "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/is_installed" || -s "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/installed_extensions" ]]; then
+        log_fatal "An initialized or dependency-installed panel exists at ${PANEL_ROOT}. Use deploy.sh update ${tag}; --refresh-source never replaces an initialized panel."
+        return "${EX_DATAERR}"
+    fi
+    [[ -f "${PANEL_ROOT}/artisan" ]] || return 0
+    detected="$(panel_source_version "${PANEL_ROOT}")"
+    if [[ "${detected}" != "${tag#v}" && "${refresh_source}" != 1 ]]; then
+        log_fatal "Unfinished panel source at ${PANEL_ROOT} reports '${detected:-unknown}', not '${tag#v}'."
+        log_info "For an unused checkout, run: sudo bash deploy.sh install ${tag} --refresh-source"
+        log_info "This fetches the release first, then privately backs up the old directory and preserves configuration and uploads. No panel files were changed."
+        return "${EX_DATAERR}"
+    fi
+}
+
+refresh_install_source() {
+    local tag="$1" backup_root source_commit file
+    check_install_destination "${tag}" 1 || return "$?"
+    [[ -f "${PANEL_ROOT}/artisan" ]] || { log_fatal "Source recovery requires an unfinished panel checkout."; return "${EX_DATAERR}"; }
+    backup_root="$(realpath -m "${BACKUP_DIR}")"
+    case "${backup_root}/" in
+        "${PANEL_ROOT}/"*) log_fatal "BACKUP_DIR must be outside PANEL_ROOT."; return "${EX_DATAERR}" ;;
+    esac
+    [[ -n "${WORK}" ]] || WORK="$(mktemp -d -t aquadactyl-install-XXXXXX)"
+    # Do all network and version checks before moving the existing checkout.
+    git -c advice.detachedHead=false clone --quiet --depth=1 --branch "${tag}" -- "${REPO_URL}" "${WORK}/release" || return "$?"
+    for file in artisan composer.lock package.json blueprint.sh; do
+        [[ -f "${WORK}/release/${file}" ]] || { log_fatal "Release is missing ${file}."; return "${EX_DATAERR}"; }
+    done
+    [[ "$(panel_source_version "${WORK}/release")" == "${tag#v}" ]] || {
+        log_fatal "Fetched source does not report the requested release. Original files are unchanged."
+        return "${EX_DATAERR}"
+    }
+    source_commit="$(git -C "${WORK}/release" rev-parse HEAD)" || return "$?"
+    # Fetching may take time; recheck initialization immediately before moving.
+    check_install_destination "${tag}" 1 || return "$?"
+    mkdir -p "${backup_root}"
+    BACKUP="$(mktemp -d "${backup_root}/preinstall-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+    chmod 0700 "${BACKUP}"
+    mv -- "${PANEL_ROOT}" "${BACKUP}/panel"
+    log_ok "Original unfinished checkout saved at ${BACKUP}/panel"
+    mkdir -p "${PANEL_ROOT}"
+    rsync -a --exclude='.git/' "${WORK}/release/" "${PANEL_ROOT}/"
+    for file in .env .blueprintrc; do
+        if [[ -e "${BACKUP}/panel/${file}" ]]; then
+            cp --preserve=mode -- "${BACKUP}/panel/${file}" "${PANEL_ROOT}/${file}"
+            chmod 0640 "${PANEL_ROOT}/${file}"
+        fi
+    done
+    if [[ -d "${BACKUP}/panel/storage/app" ]]; then
+        mkdir -p "${PANEL_ROOT}/storage/app"
+        rsync -a -- "${BACKUP}/panel/storage/app/" "${PANEL_ROOT}/storage/app/"
+    fi
+    printf '%s\n' "${source_commit}" > "${PANEL_ROOT}/.installed-commit"
+    chmod 0750 "${PANEL_ROOT}"
 }
 
 validate_os() {
@@ -973,13 +1040,19 @@ cmd_install() {
     echo -e "${CLR_CYAN}${CLR_BOLD}=== Aquadactyl Panel Full Automated Installation ===${CLR_RESET}"
 
     enforce_root_and_utf8
-    [[ $# -le 1 ]] || { log_fatal "Usage: deploy.sh install [v1.0-beta]"; exit "${EX_USAGE}"; }
-    RELEASE_TAG="${1:-${RELEASE_TAG}}"
+    local refresh_source=0 tag_seen=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --refresh-source) refresh_source=1 ;;
+            v*)
+                [[ "${tag_seen}" == 0 ]] || { log_fatal "Supply one release tag."; exit "${EX_USAGE}"; }
+                RELEASE_TAG="$1"; tag_seen=1 ;;
+            *) log_fatal "Usage: deploy.sh install [v1.0-beta] [--refresh-source]"; exit "${EX_USAGE}" ;;
+        esac
+        shift
+    done
     validate_release_tag "${RELEASE_TAG}"
-    if [[ -f "${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/is_installed" || -d "${PANEL_ROOT}/vendor" ]]; then
-        log_fatal "An existing panel was found. Use deploy.sh update ${RELEASE_TAG}; install never reprovisions an existing database."
-        exit "${EX_DATAERR}"
-    fi
+    check_install_destination "${RELEASE_TAG}" "${refresh_source}"
 
     TOTAL_STEPS=10
     CURRENT_STEP=0
@@ -995,6 +1068,9 @@ cmd_install() {
 
     # Step 2: Clone panel repository
     show_progress "Setting up Panel Filesystem"
+    if [[ "${refresh_source}" == 1 && -f "${PANEL_ROOT}/artisan" ]]; then
+        refresh_install_source "${RELEASE_TAG}"
+    fi
     if [[ ! -d "${PANEL_ROOT}" || ! -f "${PANEL_ROOT}/artisan" ]]; then
         log_info "Preparing panel directory at ${PANEL_ROOT}..."
         mkdir -p "${PANEL_ROOT}"
@@ -1013,8 +1089,8 @@ cmd_install() {
 
     cd "${PANEL_ROOT}"
 
-    if ! grep -Fq "    'version' => '${RELEASE_TAG#v}'," config/app.php; then
-        log_fatal "The source directory does not match ${RELEASE_TAG}. Start from its Git tag, or use update for an existing panel."
+    if [[ "$(panel_source_version "${PANEL_ROOT}")" != "${RELEASE_TAG#v}" ]]; then
+        log_fatal "Fetched source does not match ${RELEASE_TAG}. Original configuration has been preserved."
         exit "${EX_DATAERR}"
     fi
 
@@ -1760,6 +1836,11 @@ Commands:
   update              Fetch a Git release tag, back up and update during maintenance.
   permissions         Restore strict least-privilege permissions across PANEL_ROOT.
   remove              Complete uninstallation & rollback (stops services, drops DB, deletes panel).
+
+Unfinished Checkout Recovery:
+  sudo bash deploy.sh install v1.0-beta --refresh-source
+  Fetch the release before backing up unfinished source; preserve .env and uploads.
+  Initialized panels are refused even with --refresh-source; use update instead.
 
 Update Usage:
   sudo bash deploy.sh update <release-tag> [owner/repository]
