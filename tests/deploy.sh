@@ -4,6 +4,64 @@ source "$(dirname "$0")/../deploy.sh"
 trap - EXIT HUP INT QUIT TERM
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
+
+for release in debian:12 debian:12.12 debian:13 ubuntu:22.04 ubuntu:24.04 ubuntu:26.04; do
+    is_supported_os "${release%%:*}" "${release#*:}"
+done
+for release in debian:11 debian:14 ubuntu:20.04 ubuntu:22.10 ubuntu:24.10 ubuntu:25.04 ubuntu:25.10 ubuntu:26.10 linuxmint:22 ':22.04' 'ubuntu:'; do
+    if is_supported_os "${release%%:*}" "${release#*:}"; then
+        echo "Accepted unsupported OS: $release" >&2; exit 1
+    fi
+done
+
+# Model a host with tools already installed: OS rejection must still happen
+# before inspecting/moving panel files, provisioning or prompting for .env.
+if (
+    enforce_root_and_utf8() { :; }
+    validate_os() { echo 'unsupported-host-check' >&2; exit "$EX_UNAVAILABLE"; }
+    check_install_destination() { touch "$test_root/destination-touched"; }
+    cmd_setup_host() { touch "$test_root/provisioning-started"; }
+    cmd_install v1.0-beta --refresh-source
+) > "$test_root/unsupported-os.log" 2>&1; then
+    echo 'Install accepted an unsupported host' >&2; exit 1
+else
+    [[ "$?" == "$EX_UNAVAILABLE" ]]
+fi
+grep -q 'unsupported-host-check' "$test_root/unsupported-os.log"
+[[ ! -e "$test_root/destination-touched" && ! -e "$test_root/provisioning-started" ]]
+
+# Installed commands with incompatible versions must trigger host provisioning,
+# rather than passing Step 1 and failing after .env has been changed.
+(
+    php() { return 0; }
+    composer() { echo 'Composer version 2.9.0'; }
+    node() { echo v24.22.1; }
+    pnpm() { echo "$DEFAULT_PINNED_PNPM"; }
+    runuser() { [[ "${*: -2}" == 'pnpm --version' ]] && echo "$DEFAULT_PINNED_PNPM" || return 0; }
+    host_runtimes_ready
+    runuser() { return 1; }
+    if host_runtimes_ready; then echo 'Accepted a private runtime' >&2; exit 1; fi
+    runuser() { [[ "${*: -2}" == 'pnpm --version' ]] && echo "$DEFAULT_PINNED_PNPM" || return 0; }
+    php() { return 1; }
+    if host_runtimes_ready; then echo 'Accepted old PHP' >&2; exit 1; fi
+    php() { return 0; }
+    node() { echo v22.0.0; }
+    if host_runtimes_ready; then echo 'Accepted old Node' >&2; exit 1; fi
+    node() { echo v24.22.1; }
+    composer() { echo 'Composer version 1.10.0'; }
+    if host_runtimes_ready; then echo 'Accepted Composer 1' >&2; exit 1; fi
+    composer() { echo 'Composer version 2.9.0'; }
+    pnpm() { echo 10.0.0; }
+    if host_runtimes_ready; then echo 'Accepted mismatched pnpm' >&2; exit 1; fi
+)
+
+(
+    umask 077
+    npm() { [[ "$(umask)" == 0022 ]]; }
+    install_pinned_pnpm "$DEFAULT_PINNED_PNPM"
+    [[ "$(umask)" == 0077 ]]
+)
+
 for tag in v1.0-beta v1 v1.0.0 v2.3.4-rc.1; do validate_release_tag "$tag"; done
 for tag in '' v1.0beta v01.0 v1..2 'v1.0;id' $'v1.0\nx=1' '../v1'; do
     if validate_release_tag "$tag" >/dev/null 2>&1; then echo "Accepted unsafe tag: $tag" >&2; exit 1; fi
