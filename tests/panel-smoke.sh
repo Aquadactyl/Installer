@@ -27,6 +27,10 @@ CREATE USER 'aquadactyl'@'127.0.0.1' IDENTIFIED BY 'release-smoke-only';
 CREATE USER 'aquadactyl'@'localhost' IDENTIFIED BY 'release-smoke-only';
 GRANT ALL PRIVILEGES ON release_smoke.* TO 'aquadactyl'@'127.0.0.1';
 GRANT ALL PRIVILEGES ON release_smoke.* TO 'aquadactyl'@'localhost';
+CREATE DATABASE unrelated_app;
+CREATE TABLE unrelated_app.marker (id INT PRIMARY KEY);
+INSERT INTO unrelated_app.marker VALUES (42);
+GRANT ALL PRIVILEGES ON unrelated_app.* TO 'aquadactyl'@'127.0.0.1';
 SQL
     sed -i 's|^DB_HOST=.*|DB_HOST=127.0.0.1|;s|^DB_USERNAME=.*|DB_USERNAME=aquadactyl|' .env
 fi
@@ -81,10 +85,37 @@ test ! -f storage/framework/down
 test ! -f .blueprint/extensions/blueprint/private/db/is_installed
 test -d vendor
 
-sed -i 's|^DB_PASSWORD=.*|DB_PASSWORD=release-smoke-only|' .env
 php artisan key:generate --force
 sed -i 's|^HASHIDS_SALT=.*|HASHIDS_SALT=preserve-resume-test-salt|' .env
 php artisan down --retry=60
+if [[ ${AQUADACTYL_INSTALLER_LOCAL_DB:-} == 1 ]]; then
+    old_auth="$(mariadb -u root --batch --skip-column-names -e "SELECT SHA2(authentication_string, 256) FROM mysql.user WHERE User='aquadactyl' AND Host='127.0.0.1'")"
+    bash /tools/deploy.sh repair-database
+    test "$old_auth" = "$(mariadb -u root --batch --skip-column-names -e "SELECT SHA2(authentication_string, 256) FROM mysql.user WHERE User='aquadactyl' AND Host='127.0.0.1'")"
+    test "$(mariadb -u root --batch --skip-column-names -e 'SELECT id FROM unrelated_app.marker')" = 42
+    php <<'PHP'
+<?php
+require 'vendor/autoload.php';
+$settings = Dotenv\Dotenv::parse(file_get_contents('.env'));
+$pdo = new PDO('mysql:host=127.0.0.1;dbname=release_smoke', $settings['DB_USERNAME'], $settings['DB_PASSWORD']);
+try {
+    $pdo->query('SELECT * FROM unrelated_app.marker');
+    throw new RuntimeException('Repair account could access another database.');
+} catch (PDOException) {
+    echo "Repair account cannot read the unrelated database.\n";
+}
+PHP
+else
+    rejected_env="$(sha256sum .env)"
+    if bash /tools/deploy.sh repair-database > /reports/remote-repair-rejected.log 2>&1; then
+        echo 'Accepted local repair for a remote database.' >&2; exit 1
+    else
+        test "$?" = 69
+    fi
+    test "$rejected_env" = "$(sha256sum .env)"
+    test -z "$(find /var/backups/aquadactyl -maxdepth 1 -name 'database-auth-*' -print -quit)"
+    sed -i 's|^DB_PASSWORD=.*|DB_PASSWORD=release-smoke-only|' .env
+fi
 resume_env="$(sha256sum .env)"
 REPO_URL=/source-release bash /tools/deploy.sh install v1.0-beta --resume
 test "$resume_env" = "$(sha256sum .env)"

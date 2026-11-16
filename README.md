@@ -51,6 +51,21 @@ password; it does not synchronize that password with a newly written `.env`.
 The installer does not reset existing database-account passwords automatically.
 Database connectivity is checked before generating keys or entering maintenance.
 
+For an unfinished installation using a local database at `127.0.0.1`, a dedicated
+database-login repair is available:
+
+```bash
+sudo bash deploy.sh repair-database
+```
+
+This explicit command creates a new loopback account scoped only to the saved
+panel database. It privately backs up `.env`, verifies the new account, then
+atomically changes only `DB_USERNAME` and `DB_PASSWORD`. Existing accounts,
+passwords, grants, tables, application keys and other environment settings are
+preserved. It requires local administrator socket access through `sudo mariadb`
+and refuses remote/URL/socket configuration, system databases, initialized panels
+and mismatched source. A failed repair retains the original `.env`.
+
 After repairing the saved database configuration, resume a failed installation
 that already installed dependencies but has not initialized Blueprint:
 

@@ -1129,6 +1129,19 @@ cmd_setup_host() {
 # ------------------------------------------------------------------------------
 # 6. Full Installation Workflow (Manual Install Docs Steps 2-11)
 # ------------------------------------------------------------------------------
+cmd_repair_database() {
+    enforce_root_and_utf8
+    check_install_destination "${RELEASE_TAG}" 0 1
+    local installer_dir backup_root
+    installer_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    backup_root="$(realpath -m "${BACKUP_DIR}")"
+    case "${backup_root}/" in
+        "${PANEL_ROOT}/"*) log_fatal "BACKUP_DIR must be outside PANEL_ROOT."; return "${EX_DATAERR}" ;;
+    esac
+    log_info "Creating a dedicated account limited to the saved local panel database, with a private .env backup."
+    php "${installer_dir}/scripts/repair-database.php" "${PANEL_ROOT}" "${backup_root}"
+}
+
 cmd_install() {
     echo -e "${CLR_CYAN}${CLR_BOLD}=== Aquadactyl Panel Full Automated Installation ===${CLR_RESET}"
 
@@ -1936,6 +1949,7 @@ One-Liner Usage:
 Commands:
   install             Full panel automated install (dependencies, clone, .env, DB, Blueprint, build).
   setup-host          Install system packages (PHP 8.5, MariaDB, Node 24, pnpm 12.15.0, Composer).
+  repair-database     Configure a new dedicated local DB login for an unfinished install.
   update              Fetch a Git release tag, back up and update during maintenance.
   permissions         Restore strict least-privilege permissions across PANEL_ROOT.
   remove              Complete uninstallation & rollback (stops services, drops DB, deletes panel).
@@ -1987,6 +2001,9 @@ main() {
             ;;
         setup-host)
             cmd_setup_host "$@"
+            ;;
+        repair-database)
+            cmd_repair_database "$@"
             ;;
         update)
             cmd_update "$@"
