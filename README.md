@@ -37,6 +37,38 @@ If an earlier installer rejected Ubuntu 22.04 after recovering the source,
 select `v1.0-beta.2` and rerun `install v1.0-beta` without `--refresh-source`.
 The source already matches the release and the earlier backup remains intact.
 
+### APT repository errors
+
+Host provisioning requires a successful refresh of all configured APT
+repositories. An unrelated third-party repository with a missing Release file,
+an invalid signing key or a network error can block installation. The installer
+stops rather than use stale indexes or disable package signature verification.
+Repository definitions are in `/etc/apt/sources.list` and
+`/etc/apt/sources.list.d/` (`.list` and `.sources` files).
+
+Repair each failing repository using its vendor's instructions, keeping a backup
+of any source/keyring file you edit. The old `downloads.plex.tv/repo/deb` source
+has been replaced; use the
+[Plex repository migration guide](https://support.plex.tv/articles/235974187-enable-repository-updating-for-supported-linux-server-distributions/).
+For MaxScale's `NO_PUBKEY 5D87FACA8C27D14E`, follow
+[MariaDB's repository signing-key instructions](https://mariadb.com/docs/server/server-management/install-and-upgrade-mariadb/mariadb-package-repository-setup-and-usage#mariadb-maxscale-repository).
+Preserve the configured MariaDB server version and any other entries sharing
+the same source file; installing a panel does not require switching database
+release channels or uninstalling Plex/MaxScale.
+
+Verify the repair, then resume the same panel installation:
+
+```bash
+sudo apt-get -o APT::Update::Error-Mode=any update
+cd /opt/aquadactyl-installer
+sudo bash deploy.sh install v1.0-beta
+```
+
+Do not bypass these failures using `trusted=yes`, `--allow-unauthenticated` or
+insecure-repository flags. An `apt-key` deprecation warning is separate from a
+failed signature verification; migrate legacy keyrings using that vendor's
+scoped `signed-by` configuration.
+
 ### Recover an unfinished checkout
 
 If installation reports that an existing source directory has a different
