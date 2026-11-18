@@ -7,7 +7,7 @@ trap 'rm -rf -- "$test_root"' EXIT
 
 # The default install target follows the current panel release, independently
 # of this repository's installer version. Older explicit tags remain supported.
-[[ "$RELEASE_TAG" == v1.1-beta.2 ]]
+[[ "$RELEASE_TAG" == v1.1-beta.3 ]]
 
 # A failed host repository refresh must preserve its exit code, diagnose the
 # actual error, and request strict APT handling rather than accept stale indexes.
@@ -25,6 +25,7 @@ trap 'rm -rf -- "$test_root"' EXIT
     else
         [[ "$?" == 100 ]]
     fi
+    grep -Fxq 'Acquire::Retries=3' "$test_root/apt-arguments"
     grep -Fxq 'APT::Update::Error-Mode=any' "$test_root/apt-arguments"
     grep -q 'Package provisioning has stopped' "$test_root/apt-failure.log"
     grep -q 'legacy Plex repository has moved' "$test_root/apt-failure.log"
