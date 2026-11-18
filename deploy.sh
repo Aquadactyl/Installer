@@ -516,7 +516,7 @@ refresh_apt_indexes() {
     local description="${1:-apt-get update}" exit_code
     # APT otherwise reports some signature/network failures as warnings and may
     # continue with old indexes. Require every configured repository to refresh.
-    if run_silent "${description}" apt-get -o APT::Update::Error-Mode=any update; then
+    if run_silent "${description}" apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update; then
         return 0
     else
         exit_code=$?
@@ -1042,12 +1042,12 @@ cmd_setup_host() {
 
     log_info "Updating system packages and installing prerequisites..."
     refresh_apt_indexes || return "$?"
-    run_silent "apt-get install base packages" apt-get install -y lsb-release ca-certificates curl apt-transport-https gnupg
+    run_silent "apt-get install base packages" apt-get -o Acquire::Retries=3 install -y lsb-release ca-certificates curl apt-transport-https gnupg
 
     local os_id
     os_id="$(. /etc/os-release && echo "${ID}")"
     if [[ "${os_id}" == ubuntu ]]; then
-        run_silent "install repository tools" apt-get install -y software-properties-common
+        run_silent "install repository tools" apt-get -o Acquire::Retries=3 install -y software-properties-common
         run_silent "add Ubuntu PHP repository" add-apt-repository -y ppa:ondrej/php
     else
         run_silent "download sury keyring" curl -fSsL -o "${WORK}/keyring.deb" https://packages.sury.org/debsuryorg-archive-keyring.deb
@@ -1057,7 +1057,7 @@ cmd_setup_host() {
     refresh_apt_indexes "apt-get update (PHP repository)" || return "$?"
 
     log_info "Installing PHP ${PHP_VERSION}, MariaDB, Nginx, Redis, zip, and system tools..."
-    run_silent "apt-get install server stack" apt-get install -y \
+    run_silent "apt-get install server stack" apt-get -o Acquire::Retries=3 install -y \
         "php${PHP_VERSION}" "php${PHP_VERSION}-cli" "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-gd" \
         "php${PHP_VERSION}-mysql" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-bcmath" \
         "php${PHP_VERSION}-xml" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-zip" "php${PHP_VERSION}-posix" \

@@ -25,6 +25,7 @@ trap 'rm -rf -- "$test_root"' EXIT
     else
         [[ "$?" == 100 ]]
     fi
+    grep -Fxq 'Acquire::Retries=3' "$test_root/apt-arguments"
     grep -Fxq 'APT::Update::Error-Mode=any' "$test_root/apt-arguments"
     grep -q 'Package provisioning has stopped' "$test_root/apt-failure.log"
     grep -q 'legacy Plex repository has moved' "$test_root/apt-failure.log"
