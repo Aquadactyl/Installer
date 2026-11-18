@@ -13,8 +13,8 @@
 #   sudo bash deploy.sh permissions     # Restore strict least-privilege permissions
 #
 # Fetch a reviewed installer release through Git before running it:
-#   git clone --depth 1 --branch v1.1-beta.1 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
-#   sudo bash /opt/aquadactyl-installer/deploy.sh install v1.1-beta.2
+#   git clone --depth 1 --branch v1.1-beta.2 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+#   sudo bash /opt/aquadactyl-installer/deploy.sh install v1.1-beta.3
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -34,7 +34,7 @@ BLUEPRINT_ENVIRONMENT="${BLUEPRINT_ENVIRONMENT:-ci}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 REPO_URL="${REPO_URL:-https://github.com/Aquadactyl/aquadactyl.git}"
 DEFAULT_PINNED_PNPM="12.15.0"
-RELEASE_TAG="${RELEASE_TAG:-v1.1-beta.2}"
+RELEASE_TAG="${RELEASE_TAG:-v1.1-beta.3}"
 
 # Internal tracking
 WORK=""
@@ -244,7 +244,7 @@ semver_ge() {
 
 validate_release_tag() {
     [[ ${#1} -le 100 && "$1" =~ ^v(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){0,2}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || {
-        log_fatal "Use a versioned release tag, for example v1.1-beta.2."
+        log_fatal "Use a versioned release tag, for example v1.1-beta.3."
         return "${EX_USAGE}"
     }
 }
@@ -1155,7 +1155,7 @@ cmd_install() {
             v*)
                 [[ "${tag_seen}" == 0 ]] || { log_fatal "Supply one release tag."; exit "${EX_USAGE}"; }
                 RELEASE_TAG="$1"; tag_seen=1 ;;
-            *) log_fatal "Usage: deploy.sh install [v1.1-beta.2] [--refresh-source | --resume]"; exit "${EX_USAGE}" ;;
+            *) log_fatal "Usage: deploy.sh install [v1.1-beta.3] [--refresh-source | --resume]"; exit "${EX_USAGE}" ;;
         esac
         shift
     done
@@ -1944,9 +1944,9 @@ usage() {
 Aquadactyl Deployment & Management Automation Tooling
 
 Git Installation:
-  git clone --depth 1 --branch v1.1-beta.1 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+  git clone --depth 1 --branch v1.1-beta.2 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
   cd /opt/aquadactyl-installer
-  sudo bash deploy.sh install v1.1-beta.2
+  sudo bash deploy.sh install v1.1-beta.3
 
 Commands:
   install             Full panel automated install (dependencies, clone, .env, DB, Blueprint, build).
@@ -1957,12 +1957,12 @@ Commands:
   remove              Complete uninstallation & rollback (stops services, drops DB, deletes panel).
 
 Unfinished Checkout Recovery:
-  sudo bash deploy.sh install v1.1-beta.2 --refresh-source
+  sudo bash deploy.sh install v1.1-beta.3 --refresh-source
   Fetch the release before backing up unfinished source; preserve .env and uploads.
   Initialized panels are refused even with --refresh-source; use update instead.
 
 Resume a Failed Installation:
-  sudo bash deploy.sh install v1.1-beta.2 --resume
+  sudo bash deploy.sh install v1.1-beta.3 --resume
   Keep matching source, existing .env and keys after dependencies are installed.
   Repair database credentials first. Initialized panels must use update.
 
