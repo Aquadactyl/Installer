@@ -1,6 +1,6 @@
 # Aquadactyl Installer
 
-Git-based installation and managed updates for Aquadactyl v1.1-beta.3, with
+Git-based installation and managed updates for Aquadactyl v1.1-beta.4, with
 Blueprint included. This release is a prerelease; validate your deployment and
 addons in staging before opening it to users.
 
@@ -13,7 +13,7 @@ The script configures system packages and services on that host.
 ```bash
 git clone --depth 1 --branch v1.1-beta.2 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
 cd /opt/aquadactyl-installer
-sudo bash deploy.sh install v1.1-beta.3
+sudo bash deploy.sh install v1.1-beta.4
 ```
 
 Review `deploy.sh` before executing it. `install` selects the exact panel tag,
@@ -23,7 +23,7 @@ schema, initializes bundled Blueprint, builds assets and configures Nginx,
 `aquaq.service` and the minute scheduler. It prompts for panel/database settings
 and administrator creation. Existing initialized panels must use `update`.
 
-The installer revision (`v1.1-beta.2`) and panel release (`v1.1-beta.3`) are separate.
+The installer revision (`v1.1-beta.2`) and panel release (`v1.1-beta.4`) are separate.
 Git's detached-HEAD message is normal when selecting a release tag.
 
 Ubuntu 22.04 uses the same PHP PPA and verified Node.js 24 binaries as newer
@@ -70,7 +70,7 @@ After repairing the saved database configuration, resume a failed installation
 that already installed dependencies but has not initialized Blueprint:
 
 ```bash
-sudo bash deploy.sh install v1.1-beta.3 --resume
+sudo bash deploy.sh install v1.1-beta.4 --resume
 ```
 
 Resume requires the matching release source, an existing `.env` and `vendor/`.
@@ -83,7 +83,7 @@ repair authentication. Initialized panels or addon state require `update`.
 
 If an earlier installer rejected Ubuntu 22.04 after recovering the source,
 select Installer `v1.1-beta.2` and retry using the same panel tag as that checkout.
-To move an unfinished checkout to `v1.1-beta.3`, use the source-recovery procedure
+To move an unfinished checkout to `v1.1-beta.4`, use the source-recovery procedure
 below. Initialized panels must use `update` instead. Keep the earlier backup.
 
 ### APT repository errors
@@ -110,7 +110,7 @@ Verify the repair, then resume the same panel installation:
 ```bash
 sudo apt-get -o APT::Update::Error-Mode=any update
 cd /opt/aquadactyl-installer
-sudo bash deploy.sh install v1.1-beta.3
+sudo bash deploy.sh install v1.1-beta.4
 ```
 
 Do not bypass these failures using `trusted=yes`, `--allow-unauthenticated` or
@@ -127,7 +127,7 @@ version (for example, `canary`), and it is an unused or unfinished installation:
 cd /opt/aquadactyl-installer
 git fetch origin tag v1.1-beta.2
 git checkout --detach v1.1-beta.2
-sudo bash deploy.sh install v1.1-beta.3 --refresh-source
+sudo bash deploy.sh install v1.1-beta.4 --refresh-source
 ```
 
 Recovery fetches and validates the release first, then moves the complete old
@@ -151,7 +151,7 @@ Use a reviewed version of this installer, then select the published panel tag:
 
 ```bash
 cd /opt/aquadactyl-installer
-sudo bash deploy.sh update v1.1-beta.3
+sudo bash deploy.sh update v1.1-beta.4
 ```
 
 To select a newer installer release first, use `git fetch origin tag VERSION`
