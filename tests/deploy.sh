@@ -9,6 +9,105 @@ trap 'rm -rf -- "$test_root"' EXIT
 # of this repository's installer version. Older explicit tags remain supported.
 [[ "$RELEASE_TAG" == v1.2-beta ]]
 
+# Installed Blueprint records use a leading pipe marker and a trailing comma.
+# Preserve order, support legacy plain lists and CRLF/newline-separated records,
+# and never modify the installed metadata while parsing it.
+inventory_file="$test_root/installed_extensions"
+assert_inventory() {
+    local contents="$1" expected="$2" before
+    local parsed_extensions=()
+    printf '%s' "$contents" > "$inventory_file"
+    before="$(sha256sum "$inventory_file")"
+    read_installed_blueprint_extensions "$inventory_file" parsed_extensions
+    [[ "${parsed_extensions[*]}" == "$expected" ]]
+    [[ "$(sha256sum "$inventory_file")" == "$before" ]]
+}
+assert_inventory '|mcmods,|mcplugins,' 'mcmods mcplugins'
+assert_inventory '|mcmods,|mcplugins,|subdomains,' 'mcmods mcplugins subdomains'
+assert_inventory 'mcmods,mcplugins' 'mcmods mcplugins'
+assert_inventory $'|mcmods,|mcplugins,\r\n' 'mcmods mcplugins'
+assert_inventory $'|mcmods,\r\n|mcplugins,\r\n' 'mcmods mcplugins'
+assert_inventory $'mcmods\nmcplugins' 'mcmods mcplugins'
+assert_inventory '|mcmods,|mcmods,mcplugins,|mcplugins,' 'mcmods mcplugins'
+assert_inventory '|addon_1,|addon-2,|Addon3,' 'addon_1 addon-2 Addon3'
+assert_inventory '' ''
+assert_inventory $'\n\r\n' ''
+for bad_inventory in '|../mcmods,' '||mcmods,' '|mc|mods,' '|blueprint,' 'blueprint' '|,' '|mcmods,,|mcplugins,' '|mcmods,|mcplugins;id,' $'|mcmods,\n|bad addon,' '|mcmods,$(touch sentinel),'; do
+    printf '%s' "$bad_inventory" > "$inventory_file"
+    before="$(sha256sum "$inventory_file")"
+    parsed_extensions=(unchanged)
+    if read_installed_blueprint_extensions "$inventory_file" parsed_extensions > "$test_root/invalid-inventory.log" 2>&1; then
+        echo 'Accepted unsafe extension inventory' >&2; exit 1
+    else
+        [[ "$?" == "$EX_DATAERR" ]]
+    fi
+    [[ "${parsed_extensions[*]}" == unchanged && "$(sha256sum "$inventory_file")" == "$before" ]]
+done
+[[ ! -e sentinel ]]
+rm "$inventory_file"
+parsed_extensions=(previous)
+read_installed_blueprint_extensions "$inventory_file" parsed_extensions
+[[ "${#parsed_extensions[@]}" == 0 ]]
+ln -s "$test_root/nonexistent-inventory" "$inventory_file"
+if read_installed_blueprint_extensions "$inventory_file" parsed_extensions >/dev/null 2>&1; then
+    echo 'Accepted a symlinked extension inventory' >&2; exit 1
+fi
+rm "$inventory_file"
+
+# Exercise the real update audit with native metadata and packages in both
+# supported locations. Stop at the maintenance boundary before any live work.
+update_panel="$test_root/update-panel"
+update_release="$test_root/update-release"
+mkdir -p "$update_panel/.blueprint/extensions/blueprint/private/db" \
+    "$update_panel/.blueprint/extensions/mcplugins/build" \
+    "$update_release/.blueprint/extensions/blueprint/private"
+touch "$update_release/"{artisan,package.json,composer.lock,pnpm-lock.yaml} \
+    "$update_release/.blueprint/extensions/blueprint/private/extensionfs.php"
+tar -czf "$test_root/update-release.tar.gz" -C "$update_release" .
+update_hash="$(sha256sum "$test_root/update-release.tar.gz" | cut -d ' ' -f 1)"
+update_inventory="$update_panel/.blueprint/extensions/blueprint/private/db/installed_extensions"
+printf '|mcmods,|mcplugins,' > "$update_inventory"
+touch "$update_panel/mcmods.blueprint" "$update_panel/.blueprint/extensions/mcplugins/build/mcplugins.blueprint"
+audit_update() (
+    PANEL_ROOT="$update_panel"
+    BACKUP_DIR="$test_root/update-backups"
+    LOG_FILE="$test_root/update-audit.log"
+    preflight() { :; }
+    run_silent() { shift; "$@"; }
+    artisan() {
+        [[ "$*" == 'down --retry=60' ]]
+        printf '%s\n' "${extensions[@]}" > "$test_root/audited-extensions"
+        exit 77
+    }
+    cmd_update --archive "$test_root/update-release.tar.gz" "$update_hash"
+)
+before="$(sha256sum "$update_inventory")"
+if audit_update > "$test_root/update-audit-output.log" 2>&1; then
+    echo 'Update ran beyond its test boundary' >&2; exit 1
+else
+    [[ "$?" == 77 ]]
+fi
+[[ "$(cat "$test_root/audited-extensions")" == $'mcmods\nmcplugins' ]]
+[[ "$(sha256sum "$update_inventory")" == "$before" ]]
+rm "$test_root/audited-extensions"
+rm -r "$test_root/update-backups"
+printf '|mcmods,|../bad,' > "$update_inventory"
+if audit_update > "$test_root/update-invalid-output.log" 2>&1; then
+    echo 'Update accepted unsafe extension metadata' >&2; exit 1
+else
+    [[ "$?" == "$EX_DATAERR" ]]
+fi
+[[ ! -e "$test_root/update-backups" && ! -e "$test_root/audited-extensions" ]]
+printf '|mcmods,|mcplugins,' > "$update_inventory"
+rm "$update_panel/.blueprint/extensions/mcplugins/build/mcplugins.blueprint"
+if audit_update > "$test_root/update-missing-package.log" 2>&1; then
+    echo 'Update accepted an addon without its original package' >&2; exit 1
+else
+    [[ "$?" == "$EX_NOINPUT" ]]
+fi
+grep -q 'Keep mcplugins.blueprint' "$test_root/update-missing-package.log"
+[[ ! -e "$test_root/update-backups" && ! -e "$test_root/audited-extensions" ]]
+
 # A failed host repository refresh must preserve its exit code, diagnose the
 # actual error, and request strict APT handling rather than accept stale indexes.
 (
