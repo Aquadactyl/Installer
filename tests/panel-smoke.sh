@@ -9,7 +9,7 @@ rsync -a --exclude=.git --exclude=node_modules --exclude=vendor --exclude='.env*
   --exclude='coverage*' /panel-source/ "$PANEL_ROOT/"
 cp /panel-source/.env.example "$PANEL_ROOT/.env"
 cd "$PANEL_ROOT"
-sed -i "s/    'version' => 'canary',/    'version' => '1.0-beta',/" config/app.php
+sed -E -i "s/'version' => '[^']*'/'version' => '1.0-beta'/" config/app.php
 sed -i 's|^APP_URL=.*|APP_URL=http://localhost|;s|^DB_HOST=.*|DB_HOST=database|;s|^DB_DATABASE=.*|DB_DATABASE=release_smoke|;s|^DB_USERNAME=.*|DB_USERNAME=root|;s|^DB_PASSWORD=.*|DB_PASSWORD=release-smoke-only|;s|^REDIS_HOST=.*|REDIS_HOST=cache|;s|^SESSION_SECURE_COOKIE=.*|SESSION_SECURE_COOKIE=false|' .env
 
 # Exercise Ubuntu's local database provisioning and existing non-root account
@@ -61,7 +61,7 @@ rsync -a --exclude=.git --exclude=node_modules --exclude=vendor --exclude='.env*
   --exclude=storage --exclude=bootstrap/cache --exclude=public/build --exclude=public/hot \
   --exclude='coverage*' /panel-source/ /source-release/
 cp /panel-source/.env.example /source-release/.env.example
-sed -i "s/    'version' => 'canary',/    'version' => '1.0-beta',/" /source-release/config/app.php
+sed -E -i "s/'version' => '[^']*'/'version' => '1.0-beta'/" /source-release/config/app.php
 git -C /source-release init -q
 git -C /source-release config user.name Test
 git -C /source-release config user.email test@example.invalid
@@ -136,7 +136,7 @@ printf 'addon data\n' > .blueprint/extensions/smoke/fs/state
 # package stays in the panel root; the other exists only in its build directory.
 addon_work="$(mktemp -d)"
 for addon in rootsmoke storedsmoke; do
-    mkdir -p "$addon_work/$addon/data"
+    mkdir -p "$addon_work/$addon/data" "$addon_work/$addon/components"
     cat > "$addon_work/$addon/conf.yml" <<YAML
 info:
   name: Installer $addon
@@ -147,12 +147,23 @@ info:
 admin:
   view: view.blade.php
 dashboard:
-  css: style.css
+  components: components
 data:
   directory: data
 YAML
     printf '<p>Installer %s fixture</p>\n' "$addon" > "$addon_work/$addon/view.blade.php"
-    printf '.installer-%s { color: #123abc; }\n' "$addon" > "$addon_work/$addon/style.css"
+    addon_slot=AfterEntryName
+    [[ "$addon" != storedsmoke ]] || addon_slot=BeforeEntryName
+    cat > "$addon_work/$addon/components/Components.yml" <<YAML
+Dashboard:
+  Serverlist:
+    ServerRow:
+      $addon_slot: Fixture
+YAML
+    cat > "$addon_work/$addon/components/Fixture.tsx" <<TSX
+import React from 'react';
+export default function Fixture() { return <span>installer-$addon-frontend</span>; }
+TSX
     printf 'seed data\n' > "$addon_work/$addon/data/seed.txt"
     (cd "$addon_work/$addon" && zip -qr "$PANEL_ROOT/$addon.blueprint" .)
 done
@@ -190,7 +201,7 @@ test -z "$(find "$PANEL_ROOT" -maxdepth 1 -name '*-reapply-*.blueprint' -print -
 for addon in rootsmoke storedsmoke; do
     test "$(cat ".blueprint/extensions/$addon/private/preserved.txt")" = "preserved $addon data"
     grep -Fq "|$addon," .blueprint/extensions/blueprint/private/db/installed_extensions
-    grep -RFq ".installer-$addon" public/build/assets
+    grep -RFq "installer-$addon-frontend" public/build/assets
     php artisan route:list --path="admin/extensions/$addon" --except-vendor --no-ansi | grep -q "$addon"
 done
 test "$before" = "$(sha256sum .env)"
