@@ -33,6 +33,12 @@ jobs:
         env:
           PANEL_SOURCE_DIR: ${{ github.workspace }}/panel-source
         run: docker compose --project-name installer-panel-update --file tools/tests/compose.yaml run --build --rm panel
+      - name: Restore runner ownership of disposable reports
+        if: always()
+        run: |
+          if [ -d "$GITHUB_WORKSPACE/tools/build/installer-smoke" ]; then
+            sudo chown -R --no-dereference "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/tools/build/installer-smoke"
+          fi
       - name: Collect smoke reports
         if: always()
         uses: actions/upload-artifact@v7
