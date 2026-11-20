@@ -90,7 +90,7 @@ sed -i 's|^HASHIDS_SALT=.*|HASHIDS_SALT=preserve-resume-test-salt|' .env
 php artisan down --retry=60
 if [[ ${AQUADACTYL_INSTALLER_LOCAL_DB:-} == 1 ]]; then
     old_auth="$(mariadb -u root --batch --skip-column-names -e "SELECT SHA2(authentication_string, 256) FROM mysql.user WHERE User='aquadactyl' AND Host='127.0.0.1'")"
-    bash /tools/deploy.sh repair-database
+    RELEASE_TAG=v1.0-beta bash /tools/deploy.sh repair-database
     test "$old_auth" = "$(mariadb -u root --batch --skip-column-names -e "SELECT SHA2(authentication_string, 256) FROM mysql.user WHERE User='aquadactyl' AND Host='127.0.0.1'")"
     test "$(mariadb -u root --batch --skip-column-names -e 'SELECT id FROM unrelated_app.marker')" = 42
     php <<'PHP'
@@ -107,7 +107,7 @@ try {
 PHP
 else
     rejected_env="$(sha256sum .env)"
-    if bash /tools/deploy.sh repair-database > /reports/remote-repair-rejected.log 2>&1; then
+    if RELEASE_TAG=v1.0-beta bash /tools/deploy.sh repair-database > /reports/remote-repair-rejected.log 2>&1; then
         echo 'Accepted local repair for a remote database.' >&2; exit 1
     else
         test "$?" = 69
@@ -125,13 +125,74 @@ test -s public/build/manifest.json
 test -f .blueprint/extensions/blueprint/private/db/is_installed
 runuser -u www-data -- php artisan migrate:status
 before="$(sha256sum .env)"
-printf '\n# Retain operator configuration during updates\nPHP_FPM_SERVICE="php8.5-fpm"\n' >> .blueprintrc
+printf '\n# Retain operator configuration during updates\nPHP_FPM_SERVICE="php8.5-fpm"\nIgnoreRebuild=true\n' >> .blueprintrc
 blueprint_before="$(sha256sum .blueprintrc)"
 printf 'persistent upload\n' > storage/release-marker
 printf 'obsolete core\n' > obsolete-release-file.php
 mkdir -p .blueprint/extensions/smoke/fs
 printf 'addon data\n' > .blueprint/extensions/smoke/fs/state
+
+# Use real addons and Blueprint, not just the inventory audit. One original
+# package stays in the panel root; the other exists only in its build directory.
+addon_work="$(mktemp -d)"
+for addon in rootsmoke storedsmoke; do
+    mkdir -p "$addon_work/$addon/data"
+    cat > "$addon_work/$addon/conf.yml" <<YAML
+info:
+  name: Installer $addon
+  identifier: $addon
+  description: Managed update regression fixture
+  version: 1.0.0
+  target: beta-2026-08
+admin:
+  view: view.blade.php
+dashboard:
+  css: style.css
+data:
+  directory: data
+YAML
+    printf '<p>Installer %s fixture</p>\n' "$addon" > "$addon_work/$addon/view.blade.php"
+    printf '.installer-%s { color: #123abc; }\n' "$addon" > "$addon_work/$addon/style.css"
+    printf 'seed data\n' > "$addon_work/$addon/data/seed.txt"
+    (cd "$addon_work/$addon" && zip -qr "$PANEL_ROOT/$addon.blueprint" .)
+done
+bash blueprint.sh -bash -i rootsmoke.blueprint storedsmoke.blueprint
+for addon in rootsmoke storedsmoke; do
+    printf 'preserved %s data\n' "$addon" > ".blueprint/extensions/$addon/private/preserved.txt"
+    grep -Fq "|$addon," .blueprint/extensions/blueprint/private/db/installed_extensions
+done
+mkdir -p .blueprint/extensions/storedsmoke/build
+mv storedsmoke.blueprint .blueprint/extensions/storedsmoke/build/storedsmoke.blueprint
+root_package_before="$(sha256sum rootsmoke.blueprint)"
+stored_package_before="$(sha256sum .blueprint/extensions/storedsmoke/build/storedsmoke.blueprint)"
+
+# A failed reapplication must preserve maintenance and its snapshot. Retrying
+# the same release must then reapply both addons and finish the production build.
+cp rootsmoke.blueprint "$addon_work/rootsmoke-original.blueprint"
+sed -i 's/identifier: rootsmoke/identifier: "[identifier]"/' "$addon_work/rootsmoke/conf.yml"
+(cd "$addon_work/rootsmoke" && zip -qr "$PANEL_ROOT/rootsmoke.blueprint" .)
+if REPO_URL=/source-release bash /tools/deploy.sh update v1.0-beta > /reports/expected-addon-failure.log 2>&1; then
+    echo 'Ignored an invalid addon package during reapplication.' >&2; exit 1
+else
+    test "$?" = 1
+fi
+test -f storage/framework/down
+grep -Fq 'APPLICATION MAINTENANCE MODE HAS BEEN LEFT ACTIVE' /reports/expected-addon-failure.log
+failed_snapshot="$(find /var/backups/aquadactyl -mindepth 2 -maxdepth 2 -name database.sql -print -quit)"
+test -s "$failed_snapshot"
+cp "$addon_work/rootsmoke-original.blueprint" rootsmoke.blueprint
 REPO_URL=/source-release bash /tools/deploy.sh update v1.0-beta
+
+test -s "$failed_snapshot"
+test "$root_package_before" = "$(sha256sum rootsmoke.blueprint)"
+test "$stored_package_before" = "$(sha256sum .blueprint/extensions/storedsmoke/build/storedsmoke.blueprint)"
+test -z "$(find "$PANEL_ROOT" -maxdepth 1 -name '*-reapply-*.blueprint' -print -quit)"
+for addon in rootsmoke storedsmoke; do
+    test "$(cat ".blueprint/extensions/$addon/private/preserved.txt")" = "preserved $addon data"
+    grep -Fq "|$addon," .blueprint/extensions/blueprint/private/db/installed_extensions
+    grep -RFq ".installer-$addon" public/build/assets
+    php artisan route:list --path="admin/extensions/$addon" --except-vendor --no-ansi | grep -q "$addon"
+done
 test "$before" = "$(sha256sum .env)"
 test "$blueprint_before" = "$(sha256sum .blueprintrc)"
 test "$(cat storage/release-marker)" = 'persistent upload'
@@ -150,4 +211,4 @@ for attempt in $(seq 1 30); do
   sleep 1
 done
 grep -q '<html' /reports/login.html
-printf 'Unfinished-checkout recovery, failed database authentication, resume, Git update, data preservation, backups and login HTTP checks passed.\n'
+printf 'Unfinished-checkout recovery, failed database authentication, resume, real addon reapplication from both package locations, failed-update recovery, production build, data preservation, backups and login HTTP checks passed.\n'

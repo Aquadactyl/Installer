@@ -108,6 +108,48 @@ fi
 grep -q 'Keep mcplugins.blueprint' "$test_root/update-missing-package.log"
 [[ ! -e "$test_root/update-backups" && ! -e "$test_root/audited-extensions" ]]
 
+# Check the CLI invocation itself, including stored build packages, calls from
+# outside the panel directory, failure propagation and temporary-file cleanup.
+cat > "$update_panel/blueprint.sh" <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$EXPECTED_PANEL" && "$1" == -bash && "$2" == -i && "$#" == 3 ]]
+[[ "$3" != */* && -s "$3" ]]
+printf '%s\n' "$(cat "$3")" >> "$EXPECTED_PANEL/reapplied-packages"
+exit "${BLUEPRINT_TEST_STATUS:-0}"
+BASH
+printf 'root package\n' > "$update_panel/mcmods.blueprint"
+printf 'stored package\n' > "$update_panel/.blueprint/extensions/mcplugins/build/mcplugins.blueprint"
+(
+    PANEL_ROOT="$update_panel"
+    export EXPECTED_PANEL="$update_panel"
+    cd /
+    root_package_before="$(sha256sum "$update_panel/mcmods.blueprint")"
+    stored_package_before="$(sha256sum "$update_panel/.blueprint/extensions/mcplugins/build/mcplugins.blueprint")"
+    reapply_blueprint_extension mcmods
+    reapply_blueprint_extension mcplugins
+    [[ "$(cat "$update_panel/reapplied-packages")" == $'root package\nstored package' ]]
+    [[ "$(sha256sum "$update_panel/mcmods.blueprint")" == "$root_package_before" ]]
+    [[ "$(sha256sum "$update_panel/.blueprint/extensions/mcplugins/build/mcplugins.blueprint")" == "$stored_package_before" ]]
+    [[ -z "$(find "$update_panel" -maxdepth 1 -name '*-reapply-*.blueprint' -print -quit)" ]]
+    if BLUEPRINT_TEST_STATUS=23 reapply_blueprint_extension mcmods; then
+        echo 'Ignored a Blueprint CLI failure' >&2; exit 1
+    else
+        [[ "$?" == 23 ]]
+    fi
+    [[ -z "$(find "$update_panel" -maxdepth 1 -name '*-reapply-*.blueprint' -print -quit)" ]]
+    if reapply_blueprint_extension missing >/dev/null 2>&1; then
+        echo 'Ignored a disappeared addon package' >&2; exit 1
+    else
+        [[ "$?" == "$EX_NOINPUT" ]]
+    fi
+    if reapply_blueprint_extension ../mcmods >/dev/null 2>&1; then
+        echo 'Accepted an unsafe reapplication identifier' >&2; exit 1
+    else
+        [[ "$?" == "$EX_DATAERR" ]]
+    fi
+)
+
 # A failed host repository refresh must preserve its exit code, diagnose the
 # actual error, and request strict APT handling rather than accept stale indexes.
 (
