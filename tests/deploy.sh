@@ -7,7 +7,7 @@ trap 'rm -rf -- "$test_root"' EXIT
 
 # The default install target follows the current panel release, independently
 # of this repository's installer version. Older explicit tags remain supported.
-[[ "$RELEASE_TAG" == v1.1-beta.3 ]]
+[[ "$RELEASE_TAG" == v1.2-beta ]]
 
 # A failed host repository refresh must preserve its exit code, diagnose the
 # actual error, and request strict APT handling rather than accept stale indexes.
