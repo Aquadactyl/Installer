@@ -13,7 +13,7 @@
 #   sudo bash deploy.sh permissions     # Restore strict least-privilege permissions
 #
 # Fetch a reviewed installer release through Git before running it:
-#   git clone --depth 1 --branch v1.2-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+#   git clone --depth 1 --branch v1.3-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
 #   sudo bash /opt/aquadactyl-installer/deploy.sh install v1.2-beta
 # ==============================================================================
 
@@ -1506,6 +1506,44 @@ EOF
 # ------------------------------------------------------------------------------
 # 7. Update Workflow
 # ------------------------------------------------------------------------------
+read_installed_blueprint_extensions() {
+    local inventory_file="$1"
+    local -n inventory_result="$2"
+    local inventory_line identifier
+    local inventory_records=() parsed_inventory=()
+    local -A seen_identifiers=()
+
+    if [[ ! -e "${inventory_file}" && ! -L "${inventory_file}" ]]; then
+        inventory_result=()
+        return 0
+    fi
+    if [[ ! -f "${inventory_file}" || -L "${inventory_file}" ]]; then
+        log_fatal "Blueprint extension inventory must be a regular file."
+        return "${EX_DATAERR}"
+    fi
+
+    while IFS= read -r inventory_line || [[ -n "${inventory_line}" ]]; do
+        inventory_line="${inventory_line%$'\r'}"
+        [[ -n "${inventory_line}" ]] || continue
+        IFS=',' read -r -a inventory_records <<< "${inventory_line}"
+        for identifier in "${inventory_records[@]}"; do
+            # Blueprint stores |identifier, records. Also accept older plain
+            # identifiers, but never strip embedded/repeated marker characters.
+            identifier="${identifier#|}"
+            if [[ ! "${identifier}" =~ ^[a-zA-Z0-9_-]+$ || "${identifier}" == blueprint ]]; then
+                log_fatal "Invalid installed extension identifier in Blueprint inventory."
+                return "${EX_DATAERR}"
+            fi
+            if [[ ! -v "seen_identifiers[${identifier}]" ]]; then
+                seen_identifiers["${identifier}"]=1
+                parsed_inventory+=("${identifier}")
+            fi
+        done
+    done < "${inventory_file}" || return "${EX_DATAERR}"
+
+    inventory_result=("${parsed_inventory[@]}")
+}
+
 cmd_update() {
     local mode=""
     local release_tag=""
@@ -1632,21 +1670,11 @@ cmd_update() {
     show_progress "Auditing Installed Blueprint Extensions"
     local installed_ext_file="${PANEL_ROOT}/.blueprint/extensions/blueprint/private/db/installed_extensions"
     local extensions=()
-    if [[ -f "${installed_ext_file}" ]]; then
-        local raw_ext
-        raw_ext="$(cat "${installed_ext_file}" | tr -d '\r\n')"
-        if [[ -n "${raw_ext}" ]]; then
-            IFS=',' read -r -a extensions <<< "${raw_ext}"
-        fi
-    fi
+    read_installed_blueprint_extensions "${installed_ext_file}" extensions || return "$?"
 
     if [[ ${#extensions[@]} -gt 0 ]]; then
         log_info "Detected installed Blueprint extensions: ${extensions[*]}"
         for ext in "${extensions[@]}"; do
-            [[ "${ext}" =~ ^[a-zA-Z0-9_-]+$ && "${ext}" != blueprint ]] || {
-                log_fatal "Invalid installed extension identifier."
-                exit "${EX_DATAERR}"
-            }
             local found=0
             if [[ -f "${PANEL_ROOT}/${ext}.blueprint" || -f "${PANEL_ROOT}/.blueprint/extensions/${ext}/build/${ext}.blueprint" ]]; then
                 found=1
@@ -1944,7 +1972,7 @@ usage() {
 Aquadactyl Deployment & Management Automation Tooling
 
 Git Installation:
-  git clone --depth 1 --branch v1.2-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+  git clone --depth 1 --branch v1.3-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
   cd /opt/aquadactyl-installer
   sudo bash deploy.sh install v1.2-beta
 
