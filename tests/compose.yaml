@@ -17,7 +17,7 @@ services:
     build:
       context: ${PANEL_SOURCE_DIR:-../../aquadactyl}
       dockerfile: tests/runtime/Dockerfile
-    image: aquadactyl-installer-tests:php85
+    image: ${INSTALLER_SMOKE_IMAGE:-aquadactyl-installer-tests:php85}
     depends_on:
       database:
         condition: service_healthy
@@ -26,11 +26,12 @@ services:
     environment:
       AQUADACTYL_INSTALLER_SMOKE: 1
       COMPOSER_HOME: /composer
+      TERM: xterm
     volumes:
       - ${PANEL_SOURCE_DIR:-../../aquadactyl}:/panel-source:ro
       - ..:/tools:ro
       - ./panel-smoke.sh:/smoke.sh:ro
-      - ../build/installer-smoke:/reports
+      - ${INSTALLER_SMOKE_REPORTS:-../build/installer-smoke}:/reports
       - composer-cache:/composer
     entrypoint: [bash, /smoke.sh]
 volumes:

@@ -17,3 +17,35 @@ jobs:
       - uses: actions/checkout@v7
       - name: Provision Ubuntu 22.04 using the real installer
         run: docker build --file tests/host.Dockerfile --tag aquadactyl-installer-host-tests:22.04 .
+  panel-update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: tools
+      - uses: actions/checkout@v7
+        with:
+          repository: Aquadactyl/aquadactyl
+          ref: v1.2-beta
+          path: panel-source
+      - name: Install and update a real panel with Blueprint addons
+        env:
+          PANEL_SOURCE_DIR: ${{ github.workspace }}/panel-source
+        run: docker compose --project-name installer-panel-update --file tools/tests/compose.yaml run --build --rm panel
+      - name: Restore runner ownership of disposable reports
+        if: always()
+        run: |
+          if [ -d "$GITHUB_WORKSPACE/tools/build/installer-smoke" ]; then
+            sudo chown -R --no-dereference "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/tools/build/installer-smoke"
+          fi
+      - name: Collect smoke reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-panel-update-reports
+          path: tools/build/installer-smoke
+          if-no-files-found: ignore
+      - name: Stop disposable smoke services
+        if: always()
+        run: docker compose --project-name installer-panel-update --file tools/tests/compose.yaml down

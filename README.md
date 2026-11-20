@@ -1,6 +1,6 @@
 # Aquadactyl Installer
 
-Installer v1.3-beta provides Git-based installation and managed updates for
+Installer v1.4-beta provides Git-based installation and managed updates for
 Aquadactyl Panel v1.2-beta, with
 Blueprint included. This release is a prerelease; validate your deployment and
 addons in staging before opening it to users.
@@ -10,7 +10,7 @@ Native PHP-FPM deployments also need the
 applied to the active FPM service. Updating panel source alone does not apply
 host PHP configuration.
 
-Beta tags now advance the minor version: `v1.2-beta`, followed by `v1.3-beta`.
+Beta tags advance the minor version: `v1.2-beta`, `v1.3-beta`, `v1.4-beta`.
 The default panel target in these tools is `v1.2-beta`; pass an explicit tag
 when updating an older installation.
 
@@ -21,7 +21,7 @@ working DNS, outbound HTTPS and enough disk space for a source build and backups
 The script configures system packages and services on that host.
 
 ```bash
-git clone --depth 1 --branch v1.3-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+git clone --depth 1 --branch v1.4-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
 cd /opt/aquadactyl-installer
 sudo bash deploy.sh install v1.2-beta
 ```
@@ -33,7 +33,7 @@ schema, initializes bundled Blueprint, builds assets and configures Nginx,
 `aquaq.service` and the minute scheduler. It prompts for panel/database settings
 and administrator creation. Existing initialized panels must use `update`.
 
-The installer revision (`v1.3-beta`) and panel release (`v1.2-beta`) are separate.
+The installer revision (`v1.4-beta`) and panel release (`v1.2-beta`) are separate.
 Git's detached-HEAD message is normal when selecting a release tag.
 
 Ubuntu 22.04 uses the same PHP PPA and verified Node.js 24 binaries as newer
@@ -92,7 +92,7 @@ repair authentication. Initialized panels or addon state require `update`.
 `--resume` and `--refresh-source` cannot be combined.
 
 If an earlier installer rejected Ubuntu 22.04 after recovering the source,
-select Installer `v1.3-beta` and retry using the same panel tag as that checkout.
+select Installer `v1.4-beta` and retry using the same panel tag as that checkout.
 To move an unfinished checkout to `v1.2-beta`, use the source-recovery procedure
 below. Initialized panels must use `update` instead. Keep the earlier backup.
 
@@ -135,8 +135,8 @@ version (for example, `canary`), and it is an unused or unfinished installation:
 
 ```bash
 cd /opt/aquadactyl-installer
-git fetch origin tag v1.3-beta
-git checkout --detach v1.3-beta
+git fetch origin tag v1.4-beta
+git checkout --detach v1.4-beta
 sudo bash deploy.sh install v1.2-beta --refresh-source
 ```
 
@@ -161,12 +161,12 @@ Use a reviewed version of this installer, then select the published panel tag:
 
 ```bash
 cd /opt/aquadactyl-installer
-git fetch origin tag v1.3-beta
-git checkout --detach v1.3-beta
+git fetch origin tag v1.4-beta
+git checkout --detach v1.4-beta
 sudo bash deploy.sh update v1.2-beta
 ```
 
-These commands select Installer v1.3-beta and Panel v1.2-beta. The panel source is
+These commands select Installer v1.4-beta and Panel v1.2-beta. The panel source is
 fetched separately from the exact Git tag. Do not `git pull` over a live panel's
 addon-modified files. `.installed-commit` records Git update provenance.
 
@@ -191,7 +191,7 @@ sudo bash deploy.sh update --archive /path/to/panel.tar.gz YOUR_64_CHARACTER_SHA
 ### Invalid installed extension identifier
 
 Installer v1.2-beta incorrectly rejects native Blueprint records such as
-`|mcmods,|mcplugins,` during the extension audit. Select Installer v1.3-beta with
+`|mcmods,|mcplugins,` during the extension audit. Select Installer v1.4-beta with
 the commands above and retry the same panel update. That failure occurs before
 panel files are replaced or maintenance is enabled.
 
@@ -199,6 +199,26 @@ The fixed reader accepts Blueprint's record markers, validates addon names and
 preserves the inventory. Do not remove the markers, clear the inventory, or
 uninstall addons to bypass this check. Keep each original `.blueprint` package
 in the panel root or its existing extension build directory for reapplication.
+
+### Cannot import extensions from external paths
+
+Installer v1.3-beta and earlier pass absolute package paths to Blueprint during
+addon reapplication. Blueprint rejects those paths. Installer v1.4-beta uses a
+temporary root-level package and passes only its basename, including when the
+original package is stored in an extension build directory. Originals are kept;
+temporary packages are removed on success or failure.
+
+If an update already failed at this step, keep maintenance enabled and preserve
+its original pre-update snapshot. Select Installer v1.4-beta and rerun the same
+panel target using the update commands above. The retry creates another backup
+of the current state; it does not replace the original snapshot. Let the update
+finish addon reapplication, the production build and caches before bringing the
+panel online. Do not use `artisan up` to bypass the failed update.
+
+After a successful retry, verify addon pages and the login page. Check the queue
+services that were running before the failed attempt; if it stopped
+`aquaq.service`, start that service again. A retry cannot infer that a currently
+stopped service was running during an earlier invocation.
 
 ## Legacy addons that modify core files
 

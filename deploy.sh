@@ -13,7 +13,7 @@
 #   sudo bash deploy.sh permissions     # Restore strict least-privilege permissions
 #
 # Fetch a reviewed installer release through Git before running it:
-#   git clone --depth 1 --branch v1.3-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+#   git clone --depth 1 --branch v1.4-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
 #   sudo bash /opt/aquadactyl-installer/deploy.sh install v1.2-beta
 # ==============================================================================
 
@@ -1544,6 +1544,30 @@ read_installed_blueprint_extensions() {
     inventory_result=("${parsed_inventory[@]}")
 }
 
+reapply_blueprint_extension() (
+    local identifier="$1" source_package staged_package="" status=0
+    trap 'if [[ -n "${staged_package}" ]]; then rm -f -- "${staged_package}"; fi' EXIT
+    [[ "${identifier}" =~ ^[a-zA-Z0-9_-]+$ && "${identifier}" != blueprint ]] || exit "${EX_DATAERR}"
+
+    if [[ -f "${PANEL_ROOT}/${identifier}.blueprint" ]]; then
+        source_package="${PANEL_ROOT}/${identifier}.blueprint"
+    elif [[ -f "${PANEL_ROOT}/.blueprint/extensions/${identifier}/build/${identifier}.blueprint" ]]; then
+        source_package="${PANEL_ROOT}/.blueprint/extensions/${identifier}/build/${identifier}.blueprint"
+    else
+        log_fatal "Package for ${identifier} is no longer available; stopping addon reapplication."
+        exit "${EX_NOINPUT}"
+    fi
+
+    # Blueprint requires a basename: its import guard rejects absolute paths,
+    # and its extractor cannot handle nested package paths either. Use a private
+    # root-level copy for either source location and always remove that copy.
+    staged_package="$(mktemp --tmpdir="${PANEL_ROOT}" --suffix=.blueprint "${identifier}-reapply-XXXXXXXX")" || exit "$?"
+    cp -- "${source_package}" "${staged_package}" || exit "$?"
+    cd -- "${PANEL_ROOT}" || exit "$?"
+    bash "${PANEL_ROOT}/blueprint.sh" -bash -i "${staged_package##*/}" || status=$?
+    exit "${status}"
+)
+
 cmd_update() {
     local mode=""
     local release_tag=""
@@ -1763,17 +1787,8 @@ cmd_update() {
     # Reinstall extensions
     if [[ ${#extensions[@]} -gt 0 ]]; then
         for ext in "${extensions[@]}"; do
-            local ext_path=""
-            if [[ -f "${PANEL_ROOT}/${ext}.blueprint" ]]; then
-                ext_path="${PANEL_ROOT}/${ext}.blueprint"
-            elif [[ -f "${PANEL_ROOT}/.blueprint/extensions/${ext}/build/${ext}.blueprint" ]]; then
-                ext_path="${PANEL_ROOT}/.blueprint/extensions/${ext}/build/${ext}.blueprint"
-            fi
-
-            if [[ -n "${ext_path}" ]]; then
-                log_info "Reapplying Blueprint extension: ${ext}..."
-                run_silent "reapply extension ${ext}" bash "${PANEL_ROOT}/blueprint.sh" -bash -i "${ext_path}"
-            fi
+            log_info "Reapplying Blueprint extension: ${ext}..."
+            run_silent "reapply extension ${ext}" reapply_blueprint_extension "${ext}"
         done
     fi
 
@@ -1972,7 +1987,7 @@ usage() {
 Aquadactyl Deployment & Management Automation Tooling
 
 Git Installation:
-  git clone --depth 1 --branch v1.3-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+  git clone --depth 1 --branch v1.4-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
   cd /opt/aquadactyl-installer
   sudo bash deploy.sh install v1.2-beta
 
