@@ -1,6 +1,6 @@
 # Aquadactyl Installer
 
-Git-based installation and managed updates for Aquadactyl v1.1-beta.5, with
+Git-based installation and managed updates for Aquadactyl v1.2-beta, with
 Blueprint included. This release is a prerelease; validate your deployment and
 addons in staging before opening it to users.
 
@@ -9,6 +9,10 @@ Native PHP-FPM deployments also need the
 applied to the active FPM service. Updating panel source alone does not apply
 host PHP configuration.
 
+Beta tags now advance the minor version: `v1.2-beta`, followed by `v1.3-beta`.
+The default panel target in these tools is `v1.2-beta`; pass an explicit tag
+when updating an older installation.
+
 ## Install
 
 Use a dedicated Ubuntu 22.04/24.04/26.04 LTS or Debian 12/13 host. You need root,
@@ -16,9 +20,9 @@ working DNS, outbound HTTPS and enough disk space for a source build and backups
 The script configures system packages and services on that host.
 
 ```bash
-git clone --depth 1 --branch v1.1-beta.2 https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
+git clone --depth 1 --branch v1.2-beta https://github.com/Aquadactyl/Installer.git /opt/aquadactyl-installer
 cd /opt/aquadactyl-installer
-sudo bash deploy.sh install v1.1-beta.5
+sudo bash deploy.sh install v1.2-beta
 ```
 
 Review `deploy.sh` before executing it. `install` selects the exact panel tag,
@@ -28,7 +32,7 @@ schema, initializes bundled Blueprint, builds assets and configures Nginx,
 `aquaq.service` and the minute scheduler. It prompts for panel/database settings
 and administrator creation. Existing initialized panels must use `update`.
 
-The installer revision (`v1.1-beta.2`) and panel release (`v1.1-beta.5`) are separate.
+The installer revision (`v1.2-beta`) and panel release (`v1.2-beta`) are separate.
 Git's detached-HEAD message is normal when selecting a release tag.
 
 Ubuntu 22.04 uses the same PHP PPA and verified Node.js 24 binaries as newer
@@ -75,7 +79,7 @@ After repairing the saved database configuration, resume a failed installation
 that already installed dependencies but has not initialized Blueprint:
 
 ```bash
-sudo bash deploy.sh install v1.1-beta.5 --resume
+sudo bash deploy.sh install v1.2-beta --resume
 ```
 
 Resume requires the matching release source, an existing `.env` and `vendor/`.
@@ -87,8 +91,8 @@ repair authentication. Initialized panels or addon state require `update`.
 `--resume` and `--refresh-source` cannot be combined.
 
 If an earlier installer rejected Ubuntu 22.04 after recovering the source,
-select Installer `v1.1-beta.2` and retry using the same panel tag as that checkout.
-To move an unfinished checkout to `v1.1-beta.5`, use the source-recovery procedure
+select Installer `v1.2-beta` and retry using the same panel tag as that checkout.
+To move an unfinished checkout to `v1.2-beta`, use the source-recovery procedure
 below. Initialized panels must use `update` instead. Keep the earlier backup.
 
 ### APT repository errors
@@ -115,7 +119,7 @@ Verify the repair, then resume the same panel installation:
 ```bash
 sudo apt-get -o APT::Update::Error-Mode=any update
 cd /opt/aquadactyl-installer
-sudo bash deploy.sh install v1.1-beta.5
+sudo bash deploy.sh install v1.2-beta
 ```
 
 Do not bypass these failures using `trusted=yes`, `--allow-unauthenticated` or
@@ -130,9 +134,9 @@ version (for example, `canary`), and it is an unused or unfinished installation:
 
 ```bash
 cd /opt/aquadactyl-installer
-git fetch origin tag v1.1-beta.2
-git checkout --detach v1.1-beta.2
-sudo bash deploy.sh install v1.1-beta.5 --refresh-source
+git fetch origin tag v1.2-beta
+git checkout --detach v1.2-beta
+sudo bash deploy.sh install v1.2-beta --refresh-source
 ```
 
 Recovery fetches and validates the release first, then moves the complete old
@@ -156,7 +160,7 @@ Use a reviewed version of this installer, then select the published panel tag:
 
 ```bash
 cd /opt/aquadactyl-installer
-sudo bash deploy.sh update v1.1-beta.5
+sudo bash deploy.sh update v1.2-beta
 ```
 
 To select a newer installer release first, use `git fetch origin tag VERSION`
@@ -181,6 +185,22 @@ For an independently downloaded release archive and reviewed SHA256:
 ```bash
 sudo bash deploy.sh update --archive /path/to/panel.tar.gz YOUR_64_CHARACTER_SHA256
 ```
+
+## Legacy addons that modify core files
+
+Panel v1.2-beta stops when an addon lifecycle script fails. Some older addons
+need to copy PHP files or patch core routes, which the web user cannot change
+on a root-owned panel. After reviewing every installed addon's custom scripts,
+root operators can explicitly allow them for a managed update:
+
+```bash
+sudo BLUEPRINT__ALLOW_CORE_SCRIPTS=1 bash deploy.sh update v1.2-beta
+```
+
+This runs addon lifecycle scripts as root. It preserves root-owned panel source;
+it does not make the source web-writable. The default update omits this option.
+A failed script can already have made partial changes; inspect the deployment
+log and retained backup before resuming a failed update.
 
 ## Configuration
 
