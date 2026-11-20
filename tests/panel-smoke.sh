@@ -62,6 +62,9 @@ rsync -a --exclude=.git --exclude=node_modules --exclude=vendor --exclude='.env*
   --exclude='coverage*' /panel-source/ /source-release/
 cp /panel-source/.env.example /source-release/.env.example
 sed -E -i "s/'version' => '[^']*'/'version' => '1.0-beta'/" /source-release/config/app.php
+# Linux bind mounts retain the runner UID. The disposable release repository
+# belongs to its root-run Git commands; do not disable Git's ownership checks.
+chown -R root:root /source-release
 git -C /source-release init -q
 git -C /source-release config user.name Test
 git -C /source-release config user.email test@example.invalid
