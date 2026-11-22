@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: Aquadactyl/aquadactyl
-          ref: v1.2-beta
+          ref: v1.3-beta
           path: panel-source
       - name: Install and update a real panel with Blueprint addons
         env:
